@@ -393,6 +393,15 @@ Attachments
     # Be aware that adding and deleting attachments from items that are already created in Exchange
     # (items that have an item_id) will update the changekey of the item.
 
+SearchableMailboxes
+^^^^^^^^^^^^^^^^^^^
+
+Work in progress.
+
+    #returns the list of all mailboxes, filter not implemented for now.
+    mbox = GetSearchableMailboxes(protocol=config.protocol)
+
+
 
 Troubleshooting
 ^^^^^^^^^^^^^^^
@@ -442,3 +451,7 @@ Most, but not all, item attributes are supported. Addeing more attributes is usu
 free to open a PR or an issue.
 
 Item export and upload is supported, for efficient backup, restore and migration.
+
+
+Development
+^^^^^^^^^^^
