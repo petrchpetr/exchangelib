@@ -67,6 +67,7 @@ class Build(object):
         15: {
             0: 'Exchange2013',  # Minor builds starting from 847 are Exchange2013_SP1, see api_version()
             1: 'Exchange2016',
+            20: 'Exchange2016',  # This is Office365. See issue #221
         },
     }
 
