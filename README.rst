@@ -1,5 +1,10 @@
 Exchange Web Services client library
 ====================================
+:release:       1.10.7
+:date:          2017-12-27
+:home:          https://github.com/ecederstrand/exchangelib/
+:pypi-repo:     https://pypi.python.org/pypi/exchangelib/
+
 This module provides an well-performing, well-behaving, platform-independent and simple interface for communicating with
 a Microsoft Exchange 2007-2016 Server or Office365 using Exchange Web Services (EWS). It currently implements
 autodiscover, and functions for searching, creating, updating, deleting, exporting and uploading calendar, mailbox,
@@ -12,8 +17,8 @@ task, contact and distribution list items.
 .. image:: https://img.shields.io/pypi/pyversions/exchangelib.svg
     :target: https://pypi.python.org/pypi/exchangelib/
 
-.. image:: https://landscape.io/github/ecederstrand/exchangelib/master/landscape.png
-   :target: https://landscape.io/github/ecederstrand/exchangelib/master
+.. image:: https://api.codacy.com/project/badge/Grade/5f805ad901054a889f4b99a82d6c1cb7
+    :target: https://www.codacy.com/app/ecederstrand/exchangelib?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=ecederstrand/exchangelib&amp;utm_campaign=Badge_Grade
 
 .. image:: https://secure.travis-ci.org/ecederstrand/exchangelib.png
     :target: http://travis-ci.org/ecederstrand/exchangelib
@@ -22,9 +27,17 @@ task, contact and distribution list items.
     :target: https://coveralls.io/github/ecederstrand/exchangelib?branch=master
 
 
-Usage
------
-Here are some examples of how `exchangelib` works:
+Teaser
+------
+Here's a short example of how ``exchangelib`` works. Let's print the first 100 inbox messages in reverse order:
+
+.. code-block:: python
+
+    credentials = Credentials('john@example.com', 'topsecret')
+    account = Account('john@example.com', credentials=credentials, autodiscover=True)
+
+    for item in account.inbox.all().order_by('-datetime_received')[:100]:
+        print(item.subject, item.sender, item.datetime_received)
 
 
 Setup and connecting
@@ -32,13 +45,17 @@ Setup and connecting
 
 .. code-block:: python
 
+    from datetime import datetime, timedelta
+    import pytz
     from exchangelib import DELEGATE, IMPERSONATION, Account, Credentials, ServiceAccount, \
         EWSDateTime, EWSTimeZone, Configuration, NTLM, CalendarItem, Message, \
         Mailbox, Attendee, Q, ExtendedProperty, FileAttachment, ItemAttachment, \
-        HTMLBody, Build, Version
+        HTMLBody, Build, Version, FolderCollection
 
-    # Username in WINDOMAIN\username format. Office365 wants usernames in PrimarySMTPAddress
-    # ('myusername@example.com') format. UPN format is also supported.
+    # Specify your credentials. Username is usually in WINDOMAIN\username format, where WINDOMAIN is
+    # the name of the Windows Domain your username is connected to, but some servers also
+    # accept usernames in PrimarySMTPAddress ('myusername@example.com') format (Office365 requires it).
+    # UPN format is also supported, if your server expects that.
     credentials = Credentials(username='MYWINDOMAIN\\myusername', password='topsecret')
 
     # If you're running long-running jobs, you may want to enable fault-tolerance. Fault-tolerance
@@ -50,7 +67,22 @@ Setup and connecting
     # If you want to enable the fault tolerance, create credentials as a service account instead:
     credentials = ServiceAccount(username='FOO\\bar', password='topsecret')
 
-    # Set up a target account and do an autodiscover lookup to find the target EWS endpoint:
+    # An Account is the account on the Exchange server that you want to connect to. This can be
+    # the account associated with the credentials you connect with, or any other account on the
+    # server that you have been granted access to.
+    # 'primary_smtp_address' is the primary SMTP address assigned the account. If you enable
+    # autodiscover, an alias address will work, too. In this case, 'Account.primary_smtp_address'
+    # will be set to the primary SMTP address.
+    my_account = Account(primary_smtp_address='myusername@example.com', credentials=credentials,
+                         autodiscover=True, access_type=DELEGATE)
+    johns_account = Account(primary_smtp_address='john@example.com', credentials=credentials,
+                            autodiscover=True, access_type=DELEGATE)
+    marys_account = Account(primary_smtp_address='mary@example.com', credentials=credentials,
+                            autodiscover=True, access_type=DELEGATE)
+    still_marys_account = Account(primary_smtp_address='alias_for_mary@example.com',
+                                  credentials=credentials, autodiscover=True, access_type=DELEGATE)
+
+    # Set up a target account and do an autodiscover lookup to find the target EWS endpoint.
     account = Account(primary_smtp_address='john@example.com', credentials=credentials,
                       autodiscover=True, access_type=DELEGATE)
 
@@ -59,9 +91,8 @@ Setup and connecting
     account = Account(primary_smtp_address='john@example.com', credentials=credentials,
                       autodiscover=True, access_type=IMPERSONATION)
 
-
-    # If the server doesn't support autodiscover, use a Configuration object to set the server
-    # location:
+    # If the server doesn't support autodiscover, or you want to avoid the overhead of autodiscover,
+    # use a Configuration object to set the server location instead:
     config = Configuration(server='mail.example.com', credentials=credentials)
     account = Account(primary_smtp_address='john@example.com', config=config,
                       autodiscover=False, access_type=DELEGATE)
@@ -86,8 +117,9 @@ Setup and connecting
 
     # If you need proxy support or custom TLS validation, you can supply a custom 'requests' transport adapter, as
     # described in http://docs.python-requests.org/en/master/user/advanced/#transport-adapters
-    from exchangelib.protocol import BaseProtocol
-    BaseProcotol.HTTP_ADAPTER_CLS = MyAdapterClass
+    # exchangelib provides a sample adapter which ignores SSL validation errors. Use at own risk.
+    from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
+    BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
 
 
 Folders
@@ -98,15 +130,31 @@ Folders
     # The most common folders are available as account.calendar, account.trash, account.drafts, account.inbox,
     # account.outbox, account.sent, account.junk, account.tasks, and account.contacts.
     #
-    # If you want to access other folders, you can either traverse the account.folders dictionary, or find
-    # the folder by name, starting at a direct or indirect parent of the folder you want to find. To search
-    # the full folder hirarchy, start the search from account.root:
-    python_dev_mail_folder = account.root.get_folder_by_name('python-dev')
-    # If you have multiple folders with the same name in your folder hierarchy, start your search further down
-    # the hierarchy:
-    foo1_folder = account.inbox.get_folder_by_name('foo')
-    foo2_folder = python_dev_mail_folder.get_folder_by_name('foo')
-    # For more advanced folder traversing, use some_folder.get_folders()
+    # There are multiple ways of navigating the folder tree and searching for folders. Globbing and absolute path may
+    # create unexpected results if your folder names contain slashes.
+    some_folder.parent
+    some_folder.parent.parent.parent
+    some_folder.root  # Returns the root of the folder structure, at any level. Same as Account.root
+    some_folder.children  # A generator of child folders
+    some_folder.absolute  # Returns the absolute path, as a string
+    some_folder.walk()  # A generator returning all subfolders at arbitrary depth this level
+    # Globbing uses the normal UNIX globbing syntax
+    some_folder.glob('foo*')  # Return child folders matching the pattern
+    some_folder.glob('*/foo')  # Return subfolders named 'foo' in any child folder
+    some_folder.glob('**/foo')  # Return subfolders named 'foo' at any depth
+    some_folder / 'sub_folder' / 'even_deeper' / 'leaf'  # Works like pathlib.Path
+    some_folder.parts  # returns some_folder, some_folder.parent, some_folder.parent.parent as Folder instances
+    # tree() returns a string representation of the tree structure at the given level
+    print(root.tree())
+    '''
+    root
+    ├── inbox
+    │   └── todos
+    └── archive
+        ├── Last Job
+        ├── exchangelib issues
+        └── Mom
+    '''
 
     # Folders have some useful counters:
     account.inbox.total_count
@@ -114,6 +162,58 @@ Folders
     account.inbox.unread_count
     # Update the counters
     account.inbox.refresh()
+    # The folder structure is cached after first access. To clear the cache, refresh the root folder
+    account.root.refresh()
+
+
+    # Folders can be created, updated and deleted:
+    f = Folder(parent=self.account.inbox, name='My New Folder')
+    f.save()
+
+    f.name = 'My New Subfolder'
+    f.save()
+
+    f.delete()
+
+
+Dates, datetimes and timezones
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+EWS has some special requirements on datetimes and timezones. You need to use the special ``EWSDate``,
+``EWSDateTime`` and ``EWSTimeZone`` classes when working with dates.
+
+.. code-block:: python
+
+    # EWSTimeZone works just like pytz.timezone()
+    tz = EWSTimeZone.timezone('Europe/Copenhagen')
+    # You can also get the local timezone defined in your operating system
+    tz = EWSTimeZone.localzone()
+
+    # EWSDate and EWSDateTime work just like datetime.datetime and datetime.date. Always create timezone-aware
+    # datetimes with EWSTimeZone.localize():
+    localized_dt = tz.localize(EWSDateTime(2017, 9, 5, 8, 30))
+    right_now = tz.localize(EWSDateTime.now())
+
+    # Datetime math works transparently
+    two_hours_later = localized_dt + timedelta(hours=2)
+    two_hours = two_hours_later - localized_dt
+
+    # Dates
+    my_date = EWSDate(2017, 9, 5)
+    today = EWSDate.today()
+    also_today = right_now.date()
+
+    # UTC helpers. 'UTC' is the UTC timezone as an EWSTimeZone instance.
+    # 'UTC_NOW' returns a timezone-aware UTC timestamp of current time.
+    from exchangelib import UTC, UTC_NOW
+
+    right_now_in_utc = UTC.localize(EWSDateTime.now())
+    right_now_in_utc = UTC_NOW()
+
+    # Already have a Python datetime object you want to use? Make sure it's localized. Then pass it to from_datetime()
+    pytz_tz = pytz.timezone('Europe/Copenhagen')
+    py_dt = pytz_tz.localize(datetime(2017, 12, 11, 10, 9, 8))
+    ews_now = EWSDateTime.from_datetime(py_dt)
 
 
 Creating, updating, deleting, sending and moving
@@ -121,25 +221,38 @@ Creating, updating, deleting, sending and moving
 
 .. code-block:: python
 
-    # Create the calendar items in the user's standard calendar.  If you want to access a
-    # non-standard calendar, choose a different one from account.folders[Calendar]
+    # Here's an example of creating a calendar item in the user's standard calendar.  If you want to
+    # access a non-standard calendar, choose a different one from account.folders[Calendar].
     #
-    # You can create, update and delete single items
+    # You can create, update and delete single items:
+    from exchangelib.items import SEND_ONLY_TO_ALL, SEND_ONLY_TO_CHANGED
     item = CalendarItem(folder=account.calendar, subject='foo')
-    item.save()  # This gives the item an item_id and a changekey
+    item.save()  # This gives the item an 'item_id' and a 'changekey' value
+    item.save(send_meeting_invitations=SEND_ONLY_TO_ALL)  # Send a meeting invitation to attendees
+    # Update a field. All fields have a corresponding Python type that must be used.
     item.subject = 'bar'
+    # Print all available fields on the 'CalendarItem' class. Beware that some fields are read-only, or
+    # read-only after the item has been saved or sent, and some fields are not supported on old versions
+    # of Exchange.
+    print(CalendarItem.FIELDS)
     item.save()  # When the items has an item_id, this will update the item
-    item.delete()
-    item.move(account.trash)  # Moves the item to the trash bin
+    item.save(update_fields=['subject'])  # Only updates certain fields
+    item.save(send_meeting_invitations=SEND_ONLY_TO_CHANGED)  # Send meeting invitation, but only to attendee changes
+    item.delete()  # Hard deletinon
+    item.delete(send_meeting_cancellations=SEND_ONLY_TO_ALL)  # Send meeting cancellations to all attendees
+    item.soft_delete()  # Delete, but keep a copy in the recoverable items folder
+    item.move_to_trash()  # Move to the trash folder
+    item.move(account.trash)  # Also moves the item to the trash folder
+    item.copy(account.trash)  # Creates a copy of the item to the trash folder
 
-    # You can also send emails:
-
-    # If you don't want a local copy
+    # You can also send emails. If you don't want a local copy:
     m = Message(
         account=a,
         subject='Daily motivation',
         body='All bodies are beautiful',
-        to_recipients=[Mailbox(email_address='anne@example.com')]
+        to_recipients=[Mailbox(email_address='anne@example.com'), Mailbox(email_address='bob@example.com')],
+        cc_recipients=['carl@example.com', 'denice@example.com'],  # Simple strings work, too
+        bcc_recipients=[Mailbox(email_address='erik@example.com'), 'felicity@example.com'],  # Or a mix of both
     )
     m.send()
 
@@ -153,11 +266,14 @@ Creating, updating, deleting, sending and moving
     )
     m.send_and_save()
 
+    # Likewise, you can reply to and forward messages
+    m.reply(subject='Re: foo', body='I agree', to_recipients=['carl@example.com', 'denice@example.com'])
+    m.reply_all(subject='Re: foo', body='I agree')
+    m.forward(subject='Fwd: foo', body='Hey, look at this!', to_recipients=['carl@example.com', 'denice@example.com'])
+
     # EWS distinquishes between plain text and HTML body contents. If you want to send HTML body content, use
     # the HTMLBody helper. Clients will see this as HTML and display the body correctly:
     item.body = HTMLBody('<html><body>Hello happy <blink>OWA user!</blink></body></html>')
-    year, month, day = 2016, 3, 20
-    tz = EWSTimeZone.timezone('Europe/Copenhagen')
 
 
 Bulk operations
@@ -166,6 +282,8 @@ Bulk operations
 .. code-block:: python
 
     # Build a list of calendar items
+    tz = EWSTimeZone.timezone('Europe/Copenhagen')
+    year, month, day = 2016, 3, 20
     calendar_items = []
     for hour in range(7, 17):
         calendar_items.append(CalendarItem(
@@ -181,9 +299,30 @@ Bulk operations
             )]
         ))
 
-    # bulk_update(), bulk_delete(), bulk_move() and bulk_send() methods are also supported.
-    res = account.calendar.bulk_create(items=calendar_items)
-    print(res)
+    # Create all items at once
+    return_ids = account.bulk_create(folder=account.calendar, items=calendar_items)
+
+    # Bulk fetch, when you have a list of item IDs and want the full objects. Returns a generator.
+    calendar_ids = [(i.item_id, i.changekey) for i in calendar_items]
+    items_iter = account.fetch(ids=calendar_ids)
+    # If you only want some fields, use the 'only_fields' attribute
+    items_iter = account.fetch(ids=calendar_ids, only_fields=['start', 'subject'])
+
+    # Bulk update items. Each item must be accompanied by a list of attributes to update
+    updated_ids = account.bulk_create(items=[(i, ('start', 'subject')) for i in calendar_items])
+
+    # Move many items to a new folder
+    new_ids = account.bulk_move(ids=calendar_ids, to_folder=account.other_calendar)
+
+    # Send draft messages in bulk
+    new_ids = account.bulk_send(ids=message_ids, save_copy=False)
+
+    # Delete in bulk
+    delete_results = account.bulk_delete(ids=calendar_ids)
+
+    # Bulk delete items found as a queryset
+    account.inbox.filter(subject__startswith='Invoice').delete()
+
 
 
 Searching
@@ -240,8 +379,9 @@ Here are some examples of using the API:
     # well just reverse the sorting.
     first_ten_emails = my_folder.all().order_by('-datetime_received')[:10]  # Efficient
     last_ten_emails = my_folder.all().order_by('-datetime_received')[:-10]  # Efficient, but convoluted
-    next_ten_emails = my_folder.all().order_by('-datetime_received')[10:20]  # Still quite efficient
+    next_ten_emails = my_folder.all().order_by('-datetime_received')[10:20]  # Still quite efficient, but we fetch 20 items
     eviction_warning = my_folder.all().order_by('-datetime_received')[34298]  # This is looking for trouble
+    eviction_warning = my_folder.all().order_by('-datetime_received')[3420:3430]  # This is also looking for trouble
     some_random_emails = my_folder.all().order_by('-datetime_received')[::3]  # This is just stupid
 
     # The syntax for filter() is modeled after Django QuerySet filters. The following filter lookup types
@@ -291,28 +431,25 @@ Here are some examples of using the API:
     # By default, EWS returns only the master recurring item. If you want recurring calendar
     # items to be expanded, use calendar.view(start=..., end=...) instead.
     items = account.calendar.view(
-        start=tz.localize(EWSDateTime(year, month, day + 1)),
-        end=tz.localize(EWSDateTime(year, month, day)),
+        start=tz.localize(EWSDateTime(year, month, day)),
+        end=tz.localize(EWSDateTime(year, month, day)) + timedelta(days=1),
     )
     for item in items:
         print(item.start, item.end, item.subject, item.body, item.location)
 
-
-Deleting
-^^^^^^^^
-
-.. code-block:: python
-
-    # Delete the calendar items we found, when 'items' is a queryset
-    res = items.delete()
-    print(res)
+    # The filtering syntax also works on collections of folders, so you can search multiple folders in a single request
+    my_folder.children.filter(subject='foo')
+    my_folder.walk().filter(subject='foo')
+    my_folder.glob('foo*').filter(subject='foo')
+    # Or select the folders individually
+    FolderCollection(account=account, folders=[account.inbox, account.calendar]).filter(subject='foo')
 
 
 Extended properties
 ^^^^^^^^^^^^^^^^^^^
-Extended properties makes it possible to attach custom key-value pairs to items stored on the Exchange server. There are
-multiple online resources that describe working with extended properties, and list many of the magic values that are
-used by existing Exchange clients to store common and custom properties. The following is not a comprehensive
+Extended properties makes it possible to attach custom key-value pairs to items and folders on the Exchange server.
+There are multiple online resources that describe working with extended properties, and list many of the magic values
+that are used by existing Exchange clients to store common and custom properties. The following is not a comprehensive
 description of the possibilities, but we do intend to support all the possibilities provided by EWS.
 
 .. code-block:: python
@@ -352,6 +489,43 @@ description of the possibilities, but we do intend to support all the possibilit
         property_type = 'BinaryArray'
         property_id = 32852
 
+    # Or using distinguished property sets combined with property ID (here as a hex value to align with
+    # the format usually mentioned in Microsoft docs). This is the definition for a response to an Outlook
+    # Vote request (see issue #198):
+    class VoteResponse(ExtendedProperty):
+        distinguished_property_set_id = 'Common'
+        property_id = 0x00008524
+        property_type = 'String'
+
+    # Extended properties also work with folders. Here's an example of getting the size (in bytes) of a folder:
+    class FolderSize(ExtendedProperty):
+        property_tag = 0x0e08
+        property_type = 'Integer'
+
+    Folder.register('size', FolderSize)
+    print(my_folder.size)
+
+    # In general, here's how to work with any MAPI property as listed in e.g.
+    # https://msdn.microsoft.com/EN-US/library/office/cc815517.aspx. Let's take `PidLidTaskDueDate` as an
+    # example. This is the due date for a message maked with the follow-up flag in Microsoft Outlook.
+    #
+    # The PidLidTaskDueDate is documented here: https://msdn.microsoft.com/en-us/library/office/cc839641.aspx.
+    # The property ID is `0x00008105` and the property set is `PSETID_Task`. But EWS wants the UUID for
+    # `PSETID_Task`, so we look that up in the MS-OXPROPS pdf:
+    # https://msdn.microsoft.com/en-us/library/cc433490(v=exchg.80).aspx. The UUID is
+    # `00062003-0000-0000-C000-000000000046`. The property type is `PT_SYSTIME` which is also called
+    # `SystemTime` (see
+    # https://msdn.microsoft.com/en-us/library/microsoft.exchange.webservices.data.mapipropertytype(v=exchg.80).aspx).
+    #
+    # In conclusion, the definition for the due date becomes:
+
+    class FlagDue(ExtendedProperty):
+        property_set_id = '00062003-0000-0000-C000-000000000046'
+        property_id = 0x8105
+        property_type = 'SystemTime'
+
+    Message.register('flag_due', FlagDue)
+
 
 Attachments
 ^^^^^^^^^^^
@@ -390,6 +564,16 @@ Attachments
     # Remove the attachment again
     item.detach(my_file)
 
+    # If you want to embed an image in the item body, you can link to the file in the HTML
+    logo_filename = 'logo.png'
+    with open(logo_filename, 'rb') as f:
+        my_logo = FileAttachment(name=logo_filename, content=f.read())
+    message.attach(my_logo)
+    message.body = HTMLBody('<html><body>Hello logo: <img src="cid:%s"></body></html>' % logo_filename)
+
+    # Attachments cannot be updated via EWS. In this case, you must to detach the attachment, update the
+    # relevant fields, and attach the updated attachment.
+
     # Be aware that adding and deleting attachments from items that are already created in Exchange
     # (items that have an item_id) will update the changekey of the item.
 
@@ -403,37 +587,137 @@ Work in progress.
 
 
 
+Recurring calendar items
+^^^^^^^^^^^^^^^^^^^^^^^^
+There is full read-write support for creating recurring calendar items. You can create daily, weekly, monthly and
+yearly recurrences (the latter two in relative and absolute versions).
+
+Here's an example of creating 7 occurrences on Mondays and Wednesdays of every third week, starting September 1, 2017:
+
+.. code-block:: python
+
+    from exchangelib.recurrence import Recurrence, WeeklyPattern, MONDAY, WEDNESDAY
+
+    start = tz.localize(EWSDateTime(2017, 9, 1, 11))
+    item = CalendarItem(
+        folder=a.calendar,
+        start=start,
+        end=start + timedelta(hours=2),
+        subject='Hello Recurrence',
+        recurrence=Recurrence(
+            pattern=WeeklyPattern(interval=3, weekdays=[MONDAY, WEDNESDAY]),
+            start=start.date(),
+            number=7
+        ),
+    )
+
+    # Occurrence data for the master item
+    for i in a.calendar.filter(start__lt=end, end__gt=start):
+        print(i.subject, i.start, i.end)
+        print(i.recurrence)
+        print(i.first_occurrence)
+        print(i.last_occurrence)
+        for o in i.modified_occurrences:
+            print(o)
+        for o in i.deleted_occurrences:
+            print(o)
+
+    # All occurrences expanded. The recurrence will span over 4 iterations of a 3-week period
+    for i in a.calendar.view(start=start, end=start + timedelta(days=4*3*7)):
+        print(i.subject, i.start, i.end)
+
+
+Message timestamp fields
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Each ``Message`` item has four timestamp fields:
+
+* ``datetime_created``
+* ``datetime_sent``
+* ``datetime_received``
+* ``last_modified_time``
+
+The values for these fields are set by the Exchange server and are not modifiable via EWS. All
+values are timezone-aware ``EWSDateTime`` instances.
+
+The ``datetime_sent`` value may be earlier than ``datetime_created``.
+
+
+Out of Facility
+^^^^^^^^^^^^^^^
+
+You can get and set OOF messages using the ``Account.oof_settings`` property:
+
+.. code-block:: python
+
+    # Get the current OOF settings
+    a.oof_settings
+    # Change the OOF settings to something else
+    a.oof_settings = OofSettings(
+        state=OofSettings.SCHEDULED,
+        external_audience='Known',
+        internal_reply="I'm in the pub. See ya guys!",
+        external_reply="I'm having a business dinner in town",
+        start=tz.localize(EWSDateTime(2017, 11, 1, 11)),
+        end=tz.localize(EWSDateTime(2017, 12, 1, 11)),
+    )
+    # Disable OOF messages
+    a.oof_settings = OofSettings(
+        state=OofSettings.DISABLED,
+        internal_reply='',
+        external_reply='',
+    )
+
+
+Export and upload
+^^^^^^^^^^^^^^^^^
+Exchange supports backup and restore of folder contents using special export and upload services. They are available on
+the ``Account`` model:
+
+.. code-block:: python
+
+    data = a.export(items)  # Pass a list of Item instances or (item_id, changekey) tuples
+    a.upload((a.inbox, d) for d in data))  # Restore the items. Expects a list of (folder, data) tuples
+
+
+Non-account methods
+^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: python
+    # Get timezone information from the server
+    a.protocol.get_timezones()
+
+    # Get room lists defined on the server
+    a.protocol.get_roomlists()
+
+    # Get rooms belonging to a specific room list
+    a.protocol.get_rooms(some_roomlist)
+
+    # Get account information for a list of names or email addresses
+    a.protocol.resolve_names(['ann@example.com', 'bart@example.com'])
+
+    # Get availability information for a list of accounts
+    start = tz.localize(EWSDateTime.now())
+    end = tz.localize(EWSDateTime.now() + datetime.timedelta(hours=6))
+    # Create a list of (account, attendee_type, exclude_conflicts) tuples
+    accounts = [(account, 'Organizer', False)]
+    a.protocol.get_free_busy_info(accounts=accounts, start=start, end=end)
+
+
 Troubleshooting
 ^^^^^^^^^^^^^^^
 If you are having trouble using this library, the first thing to try is to enable debug logging. This will output a huge
-amount of information about what is going on, most notable the actual XML documents that are doing over the wite. This
+amount of information about what is going on, most notable the actual XML documents that are going over the wire. This
 can be really handy to see which fields are being sent and received.
 
 .. code-block:: python
 
     import logging
-    logging.basicConfig(level=logging.DEBUG)
+    # This handler will pretty-print and syntax highlight the request and response XML documents
+    from exchangelib.util import PrettyXmlHandler
+
+    logging.basicConfig(level=logging.DEBUG, handlers=[PrettyXmlHandler()])
     # Your code using exchangelib goes here
-
-
-When you capture a blob of interesting XML from the output, you'll want to pretty-print it to make it readable. Paste
-the blob in your favourite editor (e.g. TextMate has a pretty-print keyboard shortcut when the editor window is in XML
-mode which also highlights the XML), or use this Python snippet:
-
-.. code-block:: python
-
-    import io
-    from lxml.etree import parse, tostring
-
-    xml_str = '''
-    paste your XML blob here
-    '''
-
-    print(tostring(parse(
-        io.BytesIO(xml_str.encode())),
-        xml_declaration=True,
-        pretty_print=True
-    ).decode())
 
 
 Most class definitions have a docstring containing at least a URL to the MSDN  page for the corresponding XML element.
@@ -446,12 +730,4 @@ Most class definitions have a docstring containing at least a URL to the MSDN  p
 
 Notes
 ^^^^^
-
-Most, but not all, item attributes are supported. Addeing more attributes is usually uncomplicated. Feel
-free to open a PR or an issue.
-
-Item export and upload is supported, for efficient backup, restore and migration.
-
-
-Development
-^^^^^^^^^^^
+Almost all item fields are supported. The remaining ones are tracked in https://github.com/ecederstrand/exchangelib/issues/203.

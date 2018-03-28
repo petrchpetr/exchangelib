@@ -6,10 +6,11 @@ import logging
 
 import dateutil.parser
 import pytz
+import pytz.exceptions
 import tzlocal
 
-from .errors import NaiveDateTimeNotAllowed, UnknownTimeZone
-from .winzone import PYTZ_TO_MS_TIMEZONE_MAP
+from .errors import NaiveDateTimeNotAllowed, UnknownTimeZone, AmbiguousTimeError, NonExistentTimeError
+from .winzone import PYTZ_TO_MS_TIMEZONE_MAP, MS_TIMEZONE_TO_PYTZ_MAP
 
 log = logging.getLogger(__name__)
 
@@ -38,8 +39,8 @@ class EWSDate(datetime.date):
         return self.from_date(dt)  # We want to return EWSDate objects
 
     @classmethod
-    def fromordinal(cls, ordinal):
-        dt = super(EWSDate, cls).fromordinal(ordinal)
+    def fromordinal(cls, n):
+        dt = super(EWSDate, cls).fromordinal(n)
         return cls.from_date(dt)  # We want to return EWSDate objects
 
     @classmethod
@@ -73,10 +74,11 @@ class EWSDateTime(datetime.datetime):
         Inherits datetime and adds extra formatting required by EWS.
         """
         if 'tzinfo' in kwargs:
-            # Creating
             raise ValueError('Do not set tzinfo directly. Use EWSTimeZone.localize() instead')
-        self = super(EWSDateTime, cls).__new__(cls, *args, **kwargs)
-        return self
+        # Some internal methods still need to set tzinfo in the constructor. Use a magic kwarg for that.
+        if 'ewstzinfo' in kwargs:
+            kwargs['tzinfo'] = kwargs.pop('ewstzinfo')
+        return super(EWSDateTime, cls).__new__(cls, *args, **kwargs)
 
     def ewsformat(self):
         """
@@ -92,12 +94,15 @@ class EWSDateTime(datetime.datetime):
 
     @classmethod
     def from_datetime(cls, d):
-        dt = cls(d.year, d.month, d.day, d.hour, d.minute, d.second, d.microsecond)
-        if d.tzinfo:
-            if isinstance(d.tzinfo, EWSTimeZone):
-                return d.tzinfo.localize(dt)
-            return EWSTimeZone.from_pytz(d.tzinfo).localize(dt)
-        return dt
+        if type(d) != datetime.datetime:
+            raise ValueError("%r must be a datetime instance" % d)
+        if d.tzinfo is None:
+            tz = None
+        elif isinstance(d.tzinfo, EWSTimeZone):
+            tz = d.tzinfo
+        else:
+            tz = EWSTimeZone.from_pytz(d.tzinfo)
+        return cls(d.year, d.month, d.day, d.hour, d.minute, d.second, d.microsecond, ewstzinfo=tz)
 
     def astimezone(self, tz=None):
         t = super(EWSDateTime, self).astimezone(tz=tz)
@@ -119,7 +124,7 @@ class EWSDateTime(datetime.datetime):
         if date_string.endswith('Z'):
             # UTC datetime
             naive_dt = super(EWSDateTime, cls).strptime(date_string, '%Y-%m-%dT%H:%M:%SZ')
-            return UTC.localize(cls.from_datetime(naive_dt))
+            return UTC.localize(naive_dt)
         if len(date_string) == 19:
             # This is probably a naive datetime. Don't allow this, but signal caller with an appropriate error
             local_dt = super(EWSDateTime, cls).strptime(date_string, '%Y-%m-%dT%H:%M:%S')
@@ -134,7 +139,9 @@ class EWSDateTime(datetime.datetime):
     def now(cls, tz=None):
         # We want to return EWSDateTime objects
         t = super(EWSDateTime, cls).now(tz=tz)
-        return cls.from_datetime(t)
+        if isinstance(t, cls):
+            return t
+        return cls.from_datetime(t)  # We want to return EWSDateTime objects
 
     def date(self):
         # We want to return EWSDate objects
@@ -148,6 +155,30 @@ class EWSTimeZone(object):
     services.GetServerTimeZones.
     """
     PYTZ_TO_MS_MAP = PYTZ_TO_MS_TIMEZONE_MAP
+    MS_TO_PYTZ_MAP = MS_TIMEZONE_TO_PYTZ_MAP
+
+    def __eq__(self, other):
+        # Microsoft timezones are less granular than pytz, so an EWSTimeZone created from 'Europe/Copenhagen' may return
+        # from the server as 'Europe/Copenhagen'. We're catering for Microsoft here, so base equality on the Microsoft
+        # timezone ID.
+        return self.ms_id == other.ms_id
+
+    def __hash__(self):
+        # We're shuffling around with base classes in from_pytz(). Make sure we have __hash__() implementation.
+        return super(EWSTimeZone, self).__hash__()
+
+    @classmethod
+    def from_ms_id(cls, ms_id):
+        # Create a timezone instance from a Microsoft timezone ID. This is lossy because there is not a 1:1 translation
+        # from MS timezone ID to pytz timezone.
+        try:
+            return cls.timezone(cls.MS_TO_PYTZ_MAP[ms_id])
+        except KeyError:
+            if '/' in ms_id:
+                # EWS sometimes returns an ID that has a region/location format, e.g. 'Europe/Copenhagen'. Try the
+                # string unaltered.
+                return cls.timezone(ms_id)
+            raise UnknownTimeZone("Windows timezone ID '%s' is unknown by CLDR" % ms_id)
 
     @classmethod
     def from_pytz(cls, tz):
@@ -160,7 +191,7 @@ class EWSTimeZone(object):
         try:
             self_cls.ms_id = cls.PYTZ_TO_MS_MAP[tz.zone]
         except KeyError:
-            raise ValueError('No Windows timezone name found for timezone "%s"' % tz.zone)
+            raise UnknownTimeZone('No Windows timezone name found for timezone "%s"' % tz.zone)
 
         # We don't need the Windows long-format timezone name in long format. It's used in timezone XML elements, but
         # EWS happily accepts empty strings. For a full list of timezones supported by the target server, including
@@ -174,7 +205,10 @@ class EWSTimeZone(object):
 
     @classmethod
     def localzone(cls):
-        tz = tzlocal.get_localzone()
+        try:
+            tz = tzlocal.get_localzone()
+        except pytz.exceptions.UnknownTimeZoneError:
+            raise UnknownTimeZone("Failed to guess local timezone")
         return cls.from_pytz(tz)
 
     @classmethod
@@ -186,16 +220,38 @@ class EWSTimeZone(object):
             raise UnknownTimeZone("Timezone '%s' is unknown by pytz" % location)
         return cls.from_pytz(tz)
 
-    def normalize(self, dt):
+    def normalize(self, dt, is_dst=False):
         # super() returns a dt.tzinfo of class pytz.tzinfo.FooBar. We need to return type EWSTimeZone
-        res = super(EWSTimeZone, self).normalize(dt)
-        return res.replace(tzinfo=self.from_pytz(res.tzinfo))
+        if is_dst is not False:
+            # Not all pytz timezones support 'is_dst' argument. Only pass it on if it's set explicitly.
+            try:
+                res = super(EWSTimeZone, self).normalize(dt, is_dst=is_dst)
+            except pytz.exceptions.AmbiguousTimeError:
+                raise AmbiguousTimeError(str(dt))
+            except pytz.exceptions.NonExistentTimeError:
+                raise NonExistentTimeError(str(dt))
+        else:
+            res = super(EWSTimeZone, self).normalize(dt)
+        if not isinstance(res.tzinfo, EWSTimeZone):
+            return res.replace(tzinfo=self.from_pytz(res.tzinfo))
+        return res
 
-    def localize(self, dt):
+    def localize(self, dt, is_dst=False):
         # super() returns a dt.tzinfo of class pytz.tzinfo.FooBar. We need to return type EWSTimeZone
-        res = super(EWSTimeZone, self).localize(dt)
-        return res.replace(tzinfo=self.from_pytz(res.tzinfo))
+        if is_dst is not False:
+            # Not all pytz timezones support 'is_dst' argument. Only pass it on if it's set explicitly.
+            try:
+                res = super(EWSTimeZone, self).localize(dt, is_dst=is_dst)
+            except pytz.exceptions.AmbiguousTimeError:
+                raise AmbiguousTimeError(str(dt))
+            except pytz.exceptions.NonExistentTimeError:
+                raise NonExistentTimeError(str(dt))
+        else:
+            res = super(EWSTimeZone, self).localize(dt)
+        if not isinstance(res.tzinfo, EWSTimeZone):
+            return res.replace(tzinfo=self.from_pytz(res.tzinfo))
+        return res
+
 
 UTC = EWSTimeZone.timezone('UTC')
-
 UTC_NOW = lambda: EWSDateTime.now(tz=UTC)

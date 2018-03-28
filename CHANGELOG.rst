@@ -4,8 +4,79 @@ Change Log
 
 HEAD
 ----
+* Removed ``Folder.get_folder_by_name()`` which has been deprecated since version ``1.10.2``.
+* Added ``Item.copy(to_folder=some_folder)`` method which copies an item to the given folder and
+  returns the ID of the new item.
+* We now respect the back off value of an ``ErrorServerBusy`` server error.
+* Added support for fetching free/busy availability information ofr a list of accounts.
+* Added ``Message.reply()``, ``Message.reply_all()``, and ``Message.forward()`` methods.
+* The full search API now works on single folders *and* collections of folders, e.g.
+  ``some_folder.glob('foo*').filter()``, ``some_folder.children.filter()`` and ``some_folder.walk().filter()``.
+* Deprecated ``EWSService.CHUNKSIZE`` in favor of a per-request chunk_size available on ``Account.bulk_foo()`` methods.
+
+
+1.10.7
+------
+* Added support for registering extended properties on folders.
+* Added support for creating, updating, deleting and emptying folders.
+
+
+1.10.6
+------
+* Added support for getting and setting ``Account.oof_settings`` using the new ``OofSettings`` class.
+* Added snake_case named shortcuts to all distinguished folders on the ``Account`` model. E.g.
+  ``Account.search_folders``.
+
+
+1.10.5
+------
+* Bugfix release
+
+
+1.10.4
+------
+* Added support for most item fields. The remaining ones are mentioned in issue #203.
+
+
+1.10.3
+------
+* Added an ``exchangelib.util.PrettyXmlHandler`` log handler which will pretty-print and highlight XML requests
+  and responses.
+
+1.10.2
+------
+* Greatly improved folder navigation. See the 'Folders' section in the README
+* Added deprecation warnings for ``Account.folders`` and ``Folder.get_folder_by_name()``
+
+
+1.10.1
+------
+* Bugfix release
+
+
+1.10.0
+------
+* Removed the ``verify_ssl`` argument to ``Account``, ``discover`` and ``Configuration``. If you need to disable SSL
+  verification, register a custom ``HTTPAdapter`` class. A sample adapter class is provided for convenience:
+
+  .. code-block:: python
+
+      from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
+      BaseProcotol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
+
+
+1.9.6
+-----
+* Support new Office365 build numbers
+
+1.9.5
+-----
 * Added support for the ``effective_rights``field on items and folders.
 * Added support for custom ``requests`` transport adapters, to allow proxy support, custom TLS validation etc.
+* Default value for the ``affected_task_occurrences`` argument to ``Item.move_to_trash()``, ``Item.soft_delete()``
+  and ``Item.delete()`` was changed to ``'AllOccurrences'`` as a less surprising default when working with simple
+  tasks.
+* Added ``Task.complete()`` helper method to mark tasks as complete.
 
 1.9.4
 -----

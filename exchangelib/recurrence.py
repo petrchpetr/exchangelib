@@ -2,53 +2,11 @@ import logging
 
 from six import string_types
 
-from .fields import IntegerField, TextField, EnumField, EnumListField, DateField, DateTimeField, EWSElementField
+from .fields import IntegerField, IdField, EnumField, EnumListField, DateField, DateTimeField, EWSElementField, \
+    WEEKDAY_NAMES, MONTHS, WEEK_NUMBERS, WEEKDAYS, EXTRA_WEEKDAY_OPTIONS
 from .properties import EWSElement, ItemId
 
 log = logging.getLogger(__name__)
-
-
-# DayOfWeekIndex enum. See https://msdn.microsoft.com/en-us/library/office/aa581350(v=exchg.150).aspx
-FIRST = 'First'
-SECOND = 'Second'
-THIRD = 'Third'
-FOURTH = 'Fourth'
-LAST = 'Last'
-WEEK_NUMBERS = (FIRST, SECOND, THIRD, FOURTH, LAST)
-
-# Month enum
-JANUARY = 'January'
-FEBRUARY = 'February'
-MARCH = 'March'
-APRIL = 'April'
-MAY = 'May'
-JUNE = 'June'
-JULY = 'July'
-AUGUST = 'August'
-SEPTEMBER = 'September'
-OCTOBER = 'October'
-NOVEMBER = 'November'
-DECEMBER = 'December'
-MONTHS = (JANUARY, FEBRUARY, MARCH, APRIL, MAY, JUNE, JULY, AUGUST, SEPTEMBER, OCTOBER, NOVEMBER, DECEMBER)
-
-# Weekday enum
-MONDAY = 'Monday'
-TUESDAY = 'Tuesday'
-WEDNESDAY = 'Wednesday'
-THURSDAY = 'Thursday'
-FRIDAY = 'Friday'
-SATURDAY = 'Saturday'
-SUNDAY = 'Sunday'
-WEEKDAY_NAMES = (MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, SUNDAY)
-
-# Used for weekday recurrences except weekly recurrences. E.g. for "First WeekendDay in March"
-DAY = 'Day'
-WEEK_DAY = 'Weekday'  # Non-weekend day
-WEEKEND_DAY = 'WeekendDay'
-EXTRA_WEEKDAY_OPTIONS = (DAY, WEEK_DAY, WEEKEND_DAY)
-
-# DaysOfWeek enum: See https://msdn.microsoft.com/en-us/library/office/ee332417(v=exchg.150).aspx
-WEEKDAYS = WEEKDAY_NAMES + EXTRA_WEEKDAY_OPTIONS
 
 
 class ExtraWeekdaysField(EnumListField):
@@ -68,7 +26,7 @@ class ExtraWeekdaysField(EnumListField):
         else:
             value = list(value)  # Convert to something we can index
             for i, v in enumerate(value):
-                if isinstance(value, string_types):
+                if isinstance(v, string_types):
                     if v not in WEEKDAY_NAMES:
                         raise ValueError(
                             "List value '%s' on field '%s' must be one of %s" % (v, self.name, WEEKDAY_NAMES))
@@ -96,7 +54,8 @@ class AbsoluteYearlyPattern(Pattern):
     __slots__ = ('month', 'day_of_month')
 
     def __str__(self):
-        return 'Occurs on day %s of %s' % (self.day_of_month, MONTHS[self.month-1])
+        month = MONTHS[self.month-1] if isinstance(self.month, int) else self.month
+        return 'Occurs on day %s of %s' % (self.day_of_month, month)
 
 
 class RelativeYearlyPattern(Pattern):
@@ -117,9 +76,10 @@ class RelativeYearlyPattern(Pattern):
     __slots__ = ('month', 'week_number', 'weekdays')
 
     def __str__(self):
-        return 'Occurs on weekdays %s in the %s week of %s' % (
-            ', '.join(WEEKDAYS[i - 1] for i in self.weekdays), WEEK_NUMBERS[self.week_number-1], MONTHS[self.month-1]
-        )
+        weekdays = [WEEKDAYS[i - 1] if isinstance(i, int) else i for i in self.weekdays]
+        week_number = WEEK_NUMBERS[self.week_number-1] if isinstance(self.week_number, int) else self.week_number
+        month = MONTHS[self.month-1] if isinstance(self.month, int) else self.month
+        return 'Occurs on weekdays %s in the %s week of %s' % (', '.join(weekdays), week_number, month)
 
 
 class AbsoluteMonthlyPattern(Pattern):
@@ -157,8 +117,10 @@ class RelativeMonthlyPattern(Pattern):
     __slots__ = ('interval', 'week_number', 'weekdays')
 
     def __str__(self):
+        weekdays = [WEEKDAYS[i - 1] if isinstance(i, int) else i for i in self.weekdays]
+        week_number = WEEK_NUMBERS[self.week_number-1] if isinstance(self.week_number, int) else self.week_number
         return 'Occurs on weekdays %s in the %s week of every %s month(s)' % (
-            ', '.join(WEEKDAYS[i - 1] for i in self.weekdays), WEEK_NUMBERS[self.week_number-1], self.interval
+            ', '.join(weekdays), week_number, self.interval
         )
 
 
@@ -177,8 +139,16 @@ class WeeklyPattern(Pattern):
     __slots__ = ('interval', 'weekdays', 'first_day_of_week')
 
     def __str__(self):
+        if isinstance(self.weekdays, string_types):
+            weekdays = [self.weekdays]
+        elif isinstance(self.weekdays, int):
+            weekdays = [WEEKDAYS[self.weekdays - 1]]
+        else:
+            weekdays = [WEEKDAYS[i - 1] if isinstance(i, int) else i for i in self.weekdays]
+        first_day_of_week = WEEKDAYS[self.first_day_of_week - 1] if isinstance(self.first_day_of_week, int) \
+            else self.first_day_of_week
         return 'Occurs on weekdays %s of every %s week(s) where the first day of the week is %s' % (
-            ', '.join(WEEKDAYS[i - 1] for i in self.weekdays), self.interval, WEEKDAYS[self.first_day_of_week-1]
+            ', '.join(weekdays), self.interval, first_day_of_week
         )
 
 
@@ -231,8 +201,8 @@ class NumberedPattern(Boundary):
     FIELDS = [
         # Start date, as EWSDate
         DateField('start', field_uri='t:StartDate', is_required=True),
-        # The number of occurrences in this pattern
-        IntegerField('number', field_uri='t:NumberOfOccurrences', min=0, is_required=True),
+        # The number of occurrences in this pattern, in range 1 -> 999
+        IntegerField('number', field_uri='t:NumberOfOccurrences', min=1, max=999, is_required=True),
     ]
     __slots__ = ('start', 'number',)
 
@@ -241,9 +211,11 @@ class Occurrence(EWSElement):
     # MSDN: https://msdn.microsoft.com/en-us/library/office/aa565603(v=exchg.150).aspx
     ELEMENT_NAME = 'Occurrence'
 
+    ID_ATTR = 'ItemId'
+    CHANGEKEY_ATTR = 'ChangeKey'
     FIELDS = [
-        TextField('item_id', is_read_only=True, is_searchable=False),
-        TextField('changekey', is_read_only=True, is_searchable=False),
+        IdField('item_id', field_uri=ID_ATTR),
+        IdField('changekey', field_uri=CHANGEKEY_ATTR),
         # The modified start time of the item, as EWSDateTime
         DateTimeField('start', field_uri='t:Start'),
         # The modified end time of the item, as EWSDateTime
@@ -262,7 +234,8 @@ class Occurrence(EWSElement):
 
     @classmethod
     def from_xml(cls, elem, account):
-        assert elem.tag == cls.response_tag(), (cls, elem.tag, cls.response_tag())
+        if elem.tag != cls.response_tag():
+            raise ValueError('Unexpected element tag in class %s: %s vs %s' % (cls, elem.tag, cls.response_tag()))
         item_id, changekey = cls.id_from_xml(elem)
         kwargs = {f.name: f.from_xml(elem=elem, account=account) for f in cls.supported_fields()}
         elem.clear()

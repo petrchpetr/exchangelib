@@ -1,18 +1,27 @@
 from __future__ import unicode_literals
 
 from copy import deepcopy
+import datetime
 from decimal import Decimal
 import io
 import itertools
 import logging
+from multiprocessing import Lock
 import re
 import socket
 import time
-from xml.etree.ElementTree import Element, fromstring, ParseError
+from xml.etree.ElementTree import ElementTree, Element
 
+from defusedxml.ElementTree import fromstring, ParseError
+from defusedxml.lxml import parse, tostring, RestrictedElement
+from future.backports.misc import get_ident
 from future.moves.urllib.parse import urlparse
-from future.moves._thread import get_ident
 from future.utils import PY2
+import isodate
+from lxml.etree import XMLParser, ElementDefaultClassLookup
+from pygments import highlight
+from pygments.lexers.html import XmlLexer
+from pygments.formatters.terminal import TerminalFormatter
 import requests.exceptions
 from six import text_type, string_types
 
@@ -24,7 +33,7 @@ time_func = time.time if PY2 else time.monotonic
 
 log = logging.getLogger(__name__)
 
-ElementType = type(Element('x'))  # Type is auto-generated inside cElementTree
+ElementType = type(Element('x'))  # Type is auto-generated inside ElementTree
 string_type = string_types[0]
 
 # Regex of UTF-8 control characters that are illegal in XML 1.0 (and XML 1.1)
@@ -36,7 +45,7 @@ BOM_LEN = len(BOM)
 
 def is_iterable(value, generators_allowed=False):
     """
-    Checks if value is a list-like object. Don't match generators and generator-like objects here by default, because 
+    Checks if value is a list-like object. Don't match generators and generator-like objects here by default, because
     callers don't necessarily guarantee that they only iterate the value once. Take care to not match string types.
 
     :param value: any type of object
@@ -82,26 +91,24 @@ def peek(iterable):
         # QuerySet has __len__ but that evaluates the entire query greedily. We don't want that here. Instead, peek()
         # should be called on QuerySet.iterator()
         raise ValueError('Cannot peek on a QuerySet')
-    assert not isinstance(iterable, QuerySet)
     if hasattr(iterable, '__len__'):
         # tuple, list, set
-        return len(iterable) == 0, iterable
-    else:
-        # generator
-        try:
-            first = next(iterable)
-        except StopIteration:
-            return True, iterable
-        # We can't rewind a generator. Instead, chain the first element and the rest of the generator
-        return False, itertools.chain([first], iterable)
+        return not iterable, iterable
+    # generator
+    try:
+        first = next(iterable)
+    except StopIteration:
+        return True, iterable
+    # We can't rewind a generator. Instead, chain the first element and the rest of the generator
+    return False, itertools.chain([first], iterable)
 
 
 def xml_to_str(tree, encoding=None, xml_declaration=False):
-    from xml.etree.ElementTree import ElementTree
     # tostring() returns bytecode unless encoding is 'unicode', and does not reliably produce an XML declaration. We
     # ALWAYS want bytecode so we can convert to unicode explicitly.
     if encoding is None:
-        assert not xml_declaration
+        if xml_declaration:
+            raise ValueError("'xml_declaration' is not supported when 'encoding' is None")
         if PY2:
             stream = io.BytesIO()
         else:
@@ -127,15 +134,19 @@ def get_xml_attrs(tree, name):
 
 def value_to_xml_text(value):
     # We can't handle bytes in this function because str == bytes on Python2
-    from .ewsdatetime import EWSDateTime, EWSDate
+    from .ewsdatetime import EWSTimeZone, EWSDateTime, EWSDate
     from .indexed_properties import PhoneNumber, EmailAddress
-    from .properties import Mailbox, Attendee
+    from .properties import Mailbox, Attendee, ConversationId
     if isinstance(value, string_types):
         return safe_xml_value(value)
     if isinstance(value, bool):
         return '1' if value else '0'
     if isinstance(value, (int, Decimal)):
         return text_type(value)
+    if isinstance(value, datetime.time):
+        return value.isoformat()
+    if isinstance(value, EWSTimeZone):
+        return value.ms_id
     if isinstance(value, EWSDateTime):
         return value.ewsformat()
     if isinstance(value, EWSDate):
@@ -148,6 +159,8 @@ def value_to_xml_text(value):
         return value.email_address
     if isinstance(value, Attendee):
         return value.mailbox.email_address
+    if isinstance(value, ConversationId):
+        return value.id
     raise NotImplementedError('Unsupported type: %s (%s)' % (type(value), value))
 
 
@@ -158,23 +171,26 @@ def xml_text_to_value(value, value_type):
         bool: lambda v: True if v == 'true' else False if v == 'false' else None,
         int: int,
         Decimal: Decimal,
+        datetime.timedelta: isodate.parse_duration,
         EWSDateTime: EWSDateTime.from_string,
         string_type: lambda v: v
     }[value_type](value)
 
 
 def set_xml_value(elem, value, version):
+    from .ewsdatetime import EWSDateTime, EWSDate
     from .fields import FieldPath, FieldOrder
     from .folders import EWSElement
-    from .ewsdatetime import EWSDateTime, EWSDate
-    if isinstance(value, string_types + (bool, bytes, int, Decimal, EWSDate, EWSDateTime)):
+    from .version import Version
+    if isinstance(value, string_types + (bool, bytes, int, Decimal, datetime.time, EWSDate, EWSDateTime)):
         elem.text = value_to_xml_text(value)
     elif is_iterable(value, generators_allowed=True):
         for v in value:
             if isinstance(v, (FieldPath, FieldOrder)):
                 elem.append(v.to_xml())
             elif isinstance(v, EWSElement):
-                assert version
+                if not isinstance(version, Version):
+                    raise ValueError("'version' %r must be a Version instance" % version)
                 elem.append(v.to_xml(version=version))
             elif isinstance(v, ElementType):
                 elem.append(v)
@@ -185,7 +201,8 @@ def set_xml_value(elem, value, version):
     elif isinstance(value, (FieldPath, FieldOrder)):
         elem.append(value.to_xml())
     elif isinstance(value, EWSElement):
-        assert version
+        if not isinstance(version, Version):
+            raise ValueError("'version' %s must be a Version instance" % version)
         elem.append(value.to_xml(version=version))
     elif isinstance(value, ElementType):
         elem.append(value)
@@ -200,14 +217,19 @@ def safe_xml_value(value, replacement='?'):
 
 # Keeps a cache of Element objects to deepcopy
 _deepcopy_cache = dict()
+_deepcopy_cache_lock = Lock()
 
 
 def create_element(name, **attrs):
     # copy.deepcopy() is an order of magnitude faster than creating a new Element() every time
     key = (name, tuple(attrs.items()))  # dict requires key to be immutable
-    if name not in _deepcopy_cache:
-        _deepcopy_cache[key] = Element(name, **attrs)
-    return deepcopy(_deepcopy_cache[key])
+    try:
+        cached_elem = _deepcopy_cache[key]
+    except KeyError:
+        with _deepcopy_cache_lock:
+            # Use setdefault() because another thread may have filled the cache while we were waiting for the lock
+            cached_elem = _deepcopy_cache.setdefault(key, Element(name, **attrs))
+    return deepcopy(cached_elem)
 
 
 def add_xml_child(tree, name, value):
@@ -223,12 +245,15 @@ def to_xml(text):
             return fromstring((text[BOM_LEN:] if text.startswith(BOM) else text).encode('utf-8'))
         return fromstring(text[BOM_LEN:] if text.startswith(BOM) else text)
     except ParseError:
-        from lxml.etree import XMLParser, parse, tostring
         # Exchange servers may spit out the weirdest XML. lxml is pretty good at recovering from errors
         log.warning('Fallback to lxml processing of faulty XML')
-        magical_parser = XMLParser(recover=True)
+        magical_parser = XMLParser(recover=True, resolve_entities=False)
+        magical_parser.set_element_class_lookup(ElementDefaultClassLookup(element=RestrictedElement))
         no_bom_text = text[BOM_LEN:] if text.startswith(BOM) else text
-        root = parse(io.BytesIO(no_bom_text.encode('utf-8')), magical_parser)
+        try:
+            root = parse(io.BytesIO(no_bom_text.encode('utf-8')), parser=magical_parser)
+        except AssertionError as e:
+            raise ParseError(*e.args)
         try:
             return fromstring(tostring(root))
         except ParseError as e:
@@ -256,15 +281,68 @@ def is_xml(text):
     return text[:5] == '<?xml'
 
 
+class PrettyXmlHandler(logging.StreamHandler):
+    """A steaming log handler that prettifies log statements containing XML when output is a terminal"""
+    @staticmethod
+    def prettify_xml(xml_bytes):
+        # Re-formats an XML document to a consistent style
+        return tostring(parse(
+            io.BytesIO(xml_bytes)),
+            xml_declaration=True,
+            encoding='utf-8',
+            pretty_print=True
+        ).replace(b'\t', b'    ').replace(b' xmlns:', b'\n    xmlns:')
+
+    @staticmethod
+    def highlight_xml(xml_str):
+        # Highlights a string containing XML, using terminal color codes
+        return highlight(xml_str, XmlLexer(), TerminalFormatter())
+
+    def emit(self, record):
+        """Pretty-print and syntax highlight a log statement if all these conditions are met:
+           * This is a DEBUG message
+           * We're outputting to a terminal
+           * The log message args is a dict containing keys starting with 'xml_' and values as bytes
+        """
+        if record.levelno == logging.DEBUG and self.is_tty() and isinstance(record.args, dict):
+            for key, value in record.args.items():
+                if not key.startswith('xml_'):
+                    continue
+                if not isinstance(value, bytes):
+                    continue
+                if not is_xml(value[:10].decode('utf-8', errors='ignore')):
+                    continue
+                try:
+                    if PY2:
+                        record.args[key] = self.highlight_xml(self.prettify_xml(value)).encode('utf-8')
+                    else:
+                        record.args[key] = self.highlight_xml(self.prettify_xml(value))
+                except Exception as e:
+                    # Something bad happened, but we don't want to crash the program just because logging failed
+                    print('XML highlighting failed: %s' % e)
+        return super(PrettyXmlHandler, self).emit(record)
+
+    def is_tty(self):
+        # Check if we're outputting to a terminal
+        try:
+            return self.stream.isatty()
+        except AttributeError:
+            return False
+
+
 class DummyRequest(object):
-    headers = {}
+    def __init__(self, headers):
+        self.headers = headers
 
 
 class DummyResponse(object):
-    status_code = 503
-    headers = {}
-    text = ''
-    request = DummyRequest()
+    def __init__(self, url, headers, request_headers):
+        self.status_code = 503
+        self.url = url
+        self.headers = headers
+        self.text = ''
+        self.content = b''
+        self.request = DummyRequest(headers=request_headers)
 
 
 def get_domain(email):
@@ -285,7 +363,7 @@ def get_redirect_url(response, allow_relative=True, require_relative=False):
     # require_relative=True throws RelativeRedirect error if scheme and hostname are not equal to the request
     redirect_url = response.headers.get('location', None)
     if not redirect_url:
-        raise TransportError('302 redirect but no location header')
+        raise TransportError('HTTP redirect but no location header')
     # At least some servers are kind enough to supply a new location. It may be relative
     redirect_has_ssl, redirect_server, redirect_path = split_url(redirect_url)
     # The response may have been redirected already. Get the original URL
@@ -320,8 +398,17 @@ if not PY2:
     # Python2 does not have ConnectionResetError
     CONNECTION_ERRORS += (ConnectionResetError,)
 
+# A collection of error classes we want to handle as SSL verification errors
+SSL_ERRORS = (requests.exceptions.SSLError,)
+try:
+    # If pyOpenSSL is installed, requests will use it and throw this class on SSL errors
+    import OpenSSL.SSL
+    SSL_ERRORS += (OpenSSL.SSL.Error,)
+except ImportError:
+    pass
 
-def post_ratelimited(protocol, session, url, headers, data, timeout=None, verify=True, allow_redirects=False):
+
+def post_ratelimited(protocol, session, url, headers, data, allow_redirects=False):
     """
     There are two error-handling policies implemented here: a fail-fast policy intended for stand-alone scripts which
     fails on all responses except HTTP 200. The other policy is intended for long-running tasks that need to respect
@@ -342,13 +429,19 @@ def post_ratelimited(protocol, session, url, headers, data, timeout=None, verify
     malfunctions. The only cure is to stop making requests.
 
     The contract on sessions here is to return the session that ends up being used, or retiring the session if we
-    intend to raise an exception. We give up on max_wait timeout, not number of retries
+    intend to raise an exception. We give up on max_wait timeout, not number of retries.
+
+    An additional resource on handling throttling policies and client back off strategies:
+        https://msdn.microsoft.com/en-us/library/office/jj945066(v=exchg.150).aspx#bk_ThrottlingBatch
     """
     thread_id = get_ident()
     wait = 10  # seconds
     retry = 0
     redirects = 0
-    log_msg = '''\
+    # In Python 2, we want this to be a 'str' object so logging doesn't break (all formatting arguments are 'str').
+    # We activated 'unicode_literals' at the top of this file, so it would be a 'unicode' object unless we convert
+    # to 'str' explicitly. This is a no-op for Python 3.
+    log_msg = str('''\
 Retry: %(retry)s
 Waited: %(wait)s
 Timeout: %(timeout)s
@@ -356,43 +449,57 @@ Session: %(session_id)s
 Thread: %(thread_id)s
 Auth type: %(auth)s
 URL: %(url)s
-Verify: %(verify)s
+HTTP adapter: %(adapter)s
 Allow redirects: %(allow_redirects)s
 Response time: %(response_time)s
 Status code: %(status_code)s
 Request headers: %(request_headers)s
 Response headers: %(response_headers)s
-Request data: %(request_data)s
-Response data: %(response_data)s
-'''
+Request data: %(xml_request)s
+Response data: %(xml_response)s
+''')
     try:
         while True:
             log.debug('Session %s thread %s: retry %s timeout %s POST\'ing to %s after %ss wait', session.session_id,
-                      thread_id, retry, timeout, url, wait)
-            d1 = time_func()
+                      thread_id, retry, protocol.TIMEOUT, url, wait)
+            d_start = time_func()
             try:
-                r = session.post(url=url, headers=headers, data=data, allow_redirects=False, timeout=timeout,
-                                 verify=verify)
+                r = session.post(url=url, headers=headers, data=data, allow_redirects=False, timeout=protocol.TIMEOUT)
             except CONNECTION_ERRORS as e:
                 log.debug('Session %s thread %s: connection error POST\'ing to %s', session.session_id, thread_id, url)
-                r = DummyResponse()
-                r.request.headers = headers
-                r.headers = {'TimeoutException': e}
-            d2 = time_func()
-            log_vals = dict(retry=retry, wait=wait, timeout=timeout, session_id=session.session_id, thread_id=thread_id,
-                            auth=session.auth, url=url, verify=verify, allow_redirects=allow_redirects,
-                            response_time=d2 - d1, status_code=r.status_code, request_headers=r.request.headers,
-                            response_headers=r.headers, request_data=data, response_data=getattr(r, 'text', ''))
+                r = DummyResponse(url=url, headers={'TimeoutException': e}, request_headers=headers)
+            except Exception:
+                # Always create a dummy response for logging purposes, before re-raising
+                r = DummyResponse(url=url, headers={}, request_headers=headers)
+                raise
+            finally:
+                log_vals = dict(
+                    retry=retry,
+                    wait=wait,
+                    timeout=protocol.TIMEOUT,
+                    session_id=session.session_id,
+                    thread_id=thread_id,
+                    auth=session.auth,
+                    url=str(r.url),
+                    adapter=session.get_adapter(url),
+                    allow_redirects=allow_redirects,
+                    response_time=time_func() - d_start,
+                    status_code=r.status_code,
+                    request_headers=r.request.headers,
+                    response_headers=r.headers,
+                    xml_request=data,
+                    xml_response=r.content,
+                )
             log.debug(log_msg, log_vals)
             if _may_retry_on_error(r, protocol, wait):
                 log.info("Session %s thread %s: Connection error on URL %s (code %s). Cool down %s secs",
-                         session.session_id, thread_id, url, r.status_code, wait)
+                         session.session_id, thread_id, r.url, r.status_code, wait)
                 time.sleep(wait)  # Increase delay for every retry
                 retry += 1
                 wait *= 2
                 session = protocol.renew_session(session)
                 continue
-            if r.status_code == 302:
+            if r.status_code in (301, 302):
                 url, redirects = _redirect_or_fail(r, redirects, allow_redirects)
                 continue
             break
@@ -402,7 +509,7 @@ Response data: %(response_data)s
         raise
     except Exception as e:
         # Let higher layers handle this. Add full context for better debugging.
-        log.error('%s: %s\n%s', e.__class__.__name__, text_type(e), log_msg % log_vals)
+        log.error(str('%s: %s\n%s'), e.__class__.__name__, str(e), log_msg % log_vals)
         protocol.retire_session(session)
         raise
     if r.status_code == 500 and r.text and is_xml(r.text):
@@ -424,10 +531,8 @@ def _may_retry_on_error(r, protocol, wait):
             or (r.status_code == 302 and r.headers.get('location', '').lower() ==
                 '/ews/genericerrorpage.htm?aspxerrorpath=/ews/exchange.asmx') \
             or (r.status_code == 503):
-        # Maybe stale session. Get brand new one. But wait a bit, since the server may be rate-limiting us.
-        # This can be 302 redirect to error page, 401 authentication error or 503 service unavailable
-        if r.status_code not in (302, 401, 503):
-            # Only retry if we didn't get a useful response
+        if r.status_code not in (301, 302, 401, 503):
+            # Don't retry if we didn't get a status code that we can hope to recover from
             return False
         if protocol.credentials.fail_fast:
             return False
@@ -448,7 +553,7 @@ def _redirect_or_fail(r, redirects, allow_redirects):
         raise RedirectError(url=e.value)
     if not allow_redirects:
         raise TransportError('Redirect not allowed but we were redirected (%s -> %s)' % (r.url, redirect_url))
-    log.debug('302 Redirected to %s', redirect_url)
+    log.debug('HTTP redirected to %s', redirect_url)
     redirects += 1
     if redirects > MAX_REDIRECTS:
         raise TransportError('Max redirect count exceeded')
@@ -470,4 +575,4 @@ def _raise_response_errors(r, protocol, log_msg, log_vals):
     if 'TimeoutException' in r.headers:
         raise r.headers['TimeoutException']
     # This could be anything. Let higher layers handle this. Add full context for better debugging.
-    raise TransportError('Unknown failure\n' + log_msg % log_vals)
+    raise TransportError(str('Unknown failure\n') + log_msg % log_vals)

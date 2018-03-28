@@ -8,14 +8,14 @@ from .configuration import Configuration
 from .credentials import DELEGATE, IMPERSONATION, Credentials, ServiceAccount
 from .ewsdatetime import EWSDate, EWSDateTime, EWSTimeZone, UTC, UTC_NOW
 from .extended_properties import ExtendedProperty, ExternId
-from .folders import SHALLOW, DEEP
+from .folders import Folder, FolderCollection, SHALLOW, DEEP
 from .items import CalendarItem, Contact, DistributionList, Message, PostItem, Task
 from .mailbox import GetSearchableMailboxes, SearchableMailbox
 from .properties import Body, HTMLBody, ItemId, Mailbox, Attendee, Room, RoomList
 from .restriction import Q
 from .transport import BASIC, DIGEST, NTLM
 from .version import Build, Version
-
+from .settings import OofSettings
 __all__ = [
     'Account',
     'FileAttachment', 'ItemAttachment',
@@ -27,8 +27,9 @@ __all__ = [
     'CalendarItem', 'Contact', 'DistributionList', 'Message', 'PostItem', 'Task',
     'GetSearchableMailboxes',
     'ItemId', 'Mailbox', 'Attendee', 'Room', 'RoomList', 'Body', 'HTMLBody',
+    'OofSettings',
     'Q',
-    'SHALLOW', 'DEEP',
+    'Folder', 'FolderCollection', 'SHALLOW', 'DEEP',
     'BASIC', 'DIGEST', 'NTLM',
     'Build', 'Version',
 ]
@@ -41,7 +42,9 @@ def close_connections():
     close_protocol_connections()
 
 
-# Pre-register these extended properties
+# Pre-register these extended properties. They are not part of the standard EWS fields but are useful for identification
+# when item originates in an external system.
+
 CalendarItem.register('extern_id', ExternId)
 Message.register('extern_id', ExternId)
 Contact.register('extern_id', ExternId)

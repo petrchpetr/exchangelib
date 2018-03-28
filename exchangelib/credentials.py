@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 
 IMPERSONATION = 'impersonation'
 DELEGATE = 'delegate'
+ACCESS_TYPES = (IMPERSONATION, DELEGATE)
 
 
 @python_2_unicode_compatible
@@ -49,11 +50,11 @@ class Credentials(object):
         # policy is used.
         return True
 
-    def __hash__(self):
-        return hash((self.username, self.password))
-
     def __eq__(self, other):
         return self.username == other.username and self.password == other.password
+
+    def __hash__(self):
+        return hash((self.username, self.password))
 
     def __repr__(self):
         return self.__class__.__name__ + repr((self.username, '********'))
@@ -65,7 +66,7 @@ class Credentials(object):
 class ServiceAccount(Credentials):
     def __init__(self, username, password, max_wait=3600):
         """
-        A Credentials class that enables fault-tolerance handling. Tells internal methods to do an exponential backoff
+        A Credentials class that enables fault-tolerance handling. Tells internal methods to do an exponential back off
         when requests start failing, and wait up to max_wait seconds before failing.
         """
         super(ServiceAccount, self).__init__(username, password)

@@ -19,7 +19,8 @@ from future.moves.queue import LifoQueue, Empty, Full
 
 from .credentials import Credentials
 from .errors import TransportError
-from .services import GetServerTimeZones, GetRoomLists, GetRooms
+from .properties import FreeBusyViewOptions, MailboxData, TimeWindow, TimeZone
+from .services import GetServerTimeZones, GetRoomLists, GetRooms, ResolveNames, GetUserAvailability
 from .transport import get_auth_instance, get_service_authtype, get_docs_authtype, AUTH_TYPE_MAP, DEFAULT_HEADERS
 from .util import split_url
 from .version import Version, API_VERSIONS
@@ -49,15 +50,16 @@ class BaseProtocol(object):
     # The adapter class to use for HTTP requests. Override this if you need e.g. proxy support or specific TLS versions
     HTTP_ADAPTER_CLS = requests.adapters.HTTPAdapter
 
-    def __init__(self, service_endpoint, credentials, auth_type, verify_ssl):
-        assert isinstance(credentials, Credentials)
+    def __init__(self, service_endpoint, credentials, auth_type):
+        if not isinstance(credentials, Credentials):
+            raise ValueError("'credentials' %r must be a Credentials instance" % credentials)
         if auth_type is not None:
-            assert auth_type in AUTH_TYPE_MAP, 'Unsupported auth type %s' % auth_type
+            if auth_type not in AUTH_TYPE_MAP:
+                raise ValueError("'auth_type' %s must be one if %s" % (auth_type, AUTH_TYPE_MAP.keys()))
         self.has_ssl, self.server, _ = split_url(service_endpoint)
         self.credentials = credentials
         self.service_endpoint = service_endpoint
         self.auth_type = auth_type
-        self.verify_ssl = verify_ssl
         self._session_pool = None  # Consumers need to fill the session pool themselves
 
     def __del__(self):
@@ -72,7 +74,7 @@ class BaseProtocol(object):
         log.debug('Server %s: Closing sessions', self.server)
         while True:
             try:
-                self._session_pool.get(block=False).close_socket(self.service_endpoint)
+                self._session_pool.get(block=False).close()
             except Empty:
                 break
 
@@ -109,14 +111,14 @@ class BaseProtocol(object):
     def retire_session(self, session):
         # The session is useless. Close it completely and place a fresh session in the pool
         log.debug('Server %s: Retiring session %s', self.server, session.session_id)
-        session.close_socket(self.service_endpoint)
+        session.close()
         del session
         self.release_session(self.create_session())
 
     def renew_session(self, session):
         # The session is useless. Close it completely and place a fresh session in the pool
         log.debug('Server %s: Renewing session %s', self.server, session.session_id)
-        session.close_socket(self.service_endpoint)
+        session.close()
         del session
         return self.create_session()
 
@@ -125,13 +127,13 @@ class BaseProtocol(object):
         session.auth = get_auth_instance(credentials=self.credentials, auth_type=self.auth_type)
         # Create a copy of the headers because headers are mutable and session users may modify headers
         session.headers.update(DEFAULT_HEADERS.copy())
-        session.mount(self.service_endpoint, self.get_adapter())
+        session.mount('http://', adapter=self.get_adapter())
+        session.mount('https://', adapter=self.get_adapter())
         log.debug('Server %s: Created session %s', self.server, session.session_id)
         return session
 
     def __repr__(self):
-        return self.__class__.__name__ + repr((self.service_endpoint, self.credentials, self.auth_type,
-                                               self.verify_ssl))
+        return self.__class__.__name__ + repr((self.service_endpoint, self.credentials, self.auth_type))
 
 
 class CachingProtocol(type):
@@ -148,7 +150,7 @@ class CachingProtocol(type):
 
         # We may be using multiple different credentials and changing our minds on SSL verification. This key
         # combination should be safe.
-        _protocol_cache_key = kwargs['service_endpoint'], kwargs['credentials'], kwargs['verify_ssl']
+        _protocol_cache_key = kwargs['service_endpoint'], kwargs['credentials']
 
         protocol = cls._protocol_cache.get(_protocol_cache_key)
         if isinstance(protocol, Exception):
@@ -194,7 +196,7 @@ class Protocol(with_metaclass(CachingProtocol, BaseProtocol)):
         version = kwargs.pop('version', None)
         super(Protocol, self).__init__(*args, **kwargs)
 
-        scheme = 'https' if self.has_ssl else 'https'
+        scheme = 'https' if self.has_ssl else 'http'
         self.wsdl_url = '%s://%s/EWS/Services.wsdl' % (scheme, self.server)
         self.messages_url = '%s://%s/EWS/messages.xsd' % (scheme, self.server)
         self.types_url = '%s://%s/EWS/types.xsd' % (scheme, self.server)
@@ -202,7 +204,7 @@ class Protocol(with_metaclass(CachingProtocol, BaseProtocol)):
         # Autodetect authentication type if necessary
         if self.auth_type is None:
             self.auth_type = get_service_authtype(service_endpoint=self.service_endpoint, versions=API_VERSIONS,
-                                                  verify=self.verify_ssl, name=self.credentials.username)
+                                                  name=self.credentials.username)
 
         # Default to the auth type used by the service. We only need this if 'version' is None
         self.docs_auth_type = self.auth_type
@@ -220,7 +222,7 @@ class Protocol(with_metaclass(CachingProtocol, BaseProtocol)):
             # Version.guess() needs auth objects and a working session pool
             try:
                 # Try to get the auth_type of 'types.xsd' so we can fetch it and look at the version contained there
-                self.docs_auth_type = get_docs_authtype(verify=self.verify_ssl, docs_url=self.types_url)
+                self.docs_auth_type = get_docs_authtype(docs_url=self.types_url)
             except TransportError:
                 pass
             self.version = Version.guess(self)
@@ -232,8 +234,68 @@ class Protocol(with_metaclass(CachingProtocol, BaseProtocol)):
         thread_poolsize = 4 * self.SESSION_POOLSIZE
         self.thread_pool = ThreadPool(processes=thread_poolsize)
 
-    def get_timezones(self):
-        return GetServerTimeZones(protocol=self).call()
+    def get_timezones(self, timezones=None, return_full_timezone_data=False):
+        """ Get timezone definitions from the server
+
+        :param timezones: A list of EWSDateTime instances. If None, fetches all timezones from server
+        :param return_full_timezone_data: If true, also returns periods and transitions
+        :return: A list of (tz_id, name, periods, transitions) tuples
+        """
+        return GetServerTimeZones(protocol=self).call(
+            timezones=timezones, return_full_timezone_data=return_full_timezone_data
+        )
+
+    def get_free_busy_info(self, accounts, start, end, merged_free_busy_interval=30, requested_view='DetailedMerged'):
+        """ Returns free/busy information for a list of accounts
+
+        :param accounts: A list of (account, attendee_type, exclude_conflicts) tuples, where account is an Account
+               object, attendee_type is a MailboxData.attendee_type choice, and exclude_conflicts is a boolean.
+        :param start: The start datetime of the request
+        :param end: The end datetime of the request
+        :param merged_free_busy_interval: The interval, in minutes, of merged free/busy information
+        :param requested_view: The type of information returned. Possible values are defined in the
+               FreeBusyViewOptions.requested_view choices.
+        :return: A generator of FreeBusyView objects
+        """
+        from .account import Account
+        attendee_type_choices = {c.value for c in MailboxData.get_field_by_fieldname('attendee_type').choices}
+        for account, attendee_type, exclude_conflicts in accounts:
+            if not isinstance(account, Account):
+                raise ValueError("'accounts' item %r must be an 'Account' instance" % account)
+            if attendee_type not in attendee_type_choices:
+                raise ValueError("'accounts' item %r must be one of %s" % (attendee_type, attendee_type_choices))
+            if not isinstance(exclude_conflicts, bool):
+                raise ValueError("'accounts' item %r must be a 'bool' instance" % exclude_conflicts)
+        if start >= end:
+            raise ValueError("'start' must be less than 'end' (%s -> %s)" % (start, end))
+        if not isinstance(merged_free_busy_interval, int):
+            raise ValueError("'merged_free_busy_interval' value %r must be an 'int'" % merged_free_busy_interval)
+        requested_view_choices = {c.value for c in FreeBusyViewOptions.get_field_by_fieldname('requested_view').choices}
+        if requested_view not in requested_view_choices:
+            raise ValueError("'requested_view' value %r must be one of %s" % (requested_view, requested_view_choices))
+        tz = start.tzinfo  # The timezone of the start and end dates
+        for_year = start.year
+        _, _, periods, transitions, transitions_groups = list(self.get_timezones(
+            timezones=[tz],
+            return_full_timezone_data=True
+        ))[0]
+        timezone = TimeZone.from_server_timezone(periods, transitions, transitions_groups, for_year=for_year)
+        mailbox_data = list(
+            MailboxData(
+                email=account.primary_smtp_address,
+                attendee_type=attendee_type,
+                exclude_conflicts=exclude_conflicts
+            ) for account, attendee_type, exclude_conflicts in accounts
+        )
+        return GetUserAvailability(self).call(
+                timezone=timezone,
+                mailbox_data=mailbox_data,
+                free_busy_view_options=FreeBusyViewOptions(
+                    time_window=TimeWindow(start=start, end=end),
+                    merged_free_busy_interval=merged_free_busy_interval,
+                    requested_view=requested_view,
+                ),
+        )
 
     def get_roomlists(self):
         return GetRoomLists(protocol=self).call()
@@ -241,6 +303,19 @@ class Protocol(with_metaclass(CachingProtocol, BaseProtocol)):
     def get_rooms(self, roomlist):
         from .properties import RoomList
         return GetRooms(protocol=self).call(roomlist=RoomList(email_address=roomlist))
+
+    def resolve_names(self, names, return_full_contact_data=False, search_scope=None, shape=None):
+        from .items import SHAPE_CHOICES, SEARCH_SCOPE_CHOICES
+        if search_scope:
+            if search_scope not in SEARCH_SCOPE_CHOICES:
+                raise ValueError("'search_scope' %s must be one if %s" % (search_scope, SEARCH_SCOPE_CHOICES))
+        if shape:
+            if shape not in AUTH_TYPE_MAP:
+                raise ValueError("'shape' %s must be one if %s" % (shape, SHAPE_CHOICES))
+        return list(ResolveNames(protocol=self).call(
+            unresolved_entries=names, return_full_contact_data=return_full_contact_data, search_scope=search_scope,
+            contact_data_shape=shape,
+        ))
 
     def __str__(self):
         return '''\
@@ -266,6 +341,8 @@ class EWSSession(requests.sessions.Session):
         self.protocol = protocol
         super(EWSSession, self).__init__()
 
-    def close_socket(self, url):
-        # Close underlying socket. This ensures we don't leave stray sockets around after program exit.
-        self.get_adapter(url).close()
+
+class NoVerifyHTTPAdapter(requests.adapters.HTTPAdapter):
+    # An HTTP adapter that ignores SSL validation errors. Use at own risk.
+    def cert_verify(self, conn, url, verify, cert):
+        super(NoVerifyHTTPAdapter, self).cert_verify(conn=conn, url=url, verify=False, cert=cert)

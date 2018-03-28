@@ -54,7 +54,7 @@ class Q(object):
                     LOOKUP_IEXACT, LOOKUP_CONTAINS, LOOKUP_ICONTAINS, LOOKUP_STARTSWITH, LOOKUP_ISTARTSWITH,
                     LOOKUP_EXISTS}
 
-    __slots__ = 'conn_type', 'field_path', 'op', 'value', 'children', 'query_string'
+    __slots__ = ('conn_type', 'field_path', 'op', 'value', 'children', 'query_string')
 
     def __init__(self, *args, **kwargs):
         self.conn_type = kwargs.pop('conn_type', self.AND)
@@ -64,93 +64,36 @@ class Q(object):
         self.value = None
         self.query_string = None
 
-        # Build children of Q objects from *args and **kwargs
+        # Parsing of args and kwargs may require child elements
         self.children = []
 
+        # Remove any empty Q elements in args before proceeding
+        args = tuple(a for a in args if not (isinstance(a, self.__class__) and a.is_empty()))
+
+        # Check for query string, or Q object containing query string, as the only argument
+        if len(args) == 1 and not kwargs:
+            if isinstance(args[0], string_types):
+                self.query_string = args[0]
+                return
+            if isinstance(args[0], self.__class__) and args[0].query_string:
+                self.query_string = args[0].query_string
+                return
+
+        # Parse args which must be Q objects
         for q in args:
-            if isinstance(q, string_types):
-                if kwargs or not self.is_empty():
-                    raise ValueError('A query string cannot be combined with other restrictions')
-                self.query_string = q
-                continue
-
             if not isinstance(q, self.__class__):
-                raise ValueError("Non-keyword arg '%s' must be a Q object" % q)
+                raise ValueError("Non-keyword arg %r must be a Q object" % q)
             if q.query_string:
-                if kwargs or not self.is_empty():
-                    raise ValueError('A query string cannot be combined with other restrictions')
-                self.query_string = q.query_string
-                continue
-            if not q.is_empty():
-                if self.query_string:
-                    raise ValueError('A query string cannot be combined with other restrictions')
-                self.children.append(q)
+                raise ValueError(
+                    'A query string cannot be combined with other restrictions (args: %r, kwargs: %r)' % (args, kwargs)
+                )
+            self.children.append(q)
 
+        # Parse keyword args and extract the filter
+        is_single_kwarg = len(args) == 0 and len(kwargs) == 1
         for key, value in kwargs.items():
-            key_parts = key.rsplit('__', 1)
-            if len(key_parts) == 2 and key_parts[1] in self.LOOKUP_TYPES:
-                # This is a kwarg with a lookup at the end
-                field_path, lookup = key_parts
-                if lookup == self.LOOKUP_EXISTS:
-                    # value=True will fall through to further processing
-                    if not value:
-                        self.children.append(~self.__class__(**{key: True}))
-                        continue
-
-                if lookup == self.LOOKUP_RANGE:
-                    # EWS doesn't have a 'range' operator. Emulate 'foo__range=(1, 2)' as 'foo__gte=1 and foo__lte=2'
-                    # (both values inclusive).
-                    if len(value) != 2:
-                        raise ValueError("Value of lookup '%s' must have exactly 2 elements" % key)
-                    self.children.append(self.__class__(**{'%s__gte' % field_path: value[0]}))
-                    self.children.append(self.__class__(**{'%s__lte' % field_path: value[1]}))
-                    continue
-
-                if lookup == self.LOOKUP_IN:
-                    # EWS doesn't have an '__in' operator. Allow '__in' lookups on list and non-list field types,
-                    # specifying a list value. We'll emulate it as a set of OR'ed exact matches.
-                    if not is_iterable(value, generators_allowed=True):
-                        raise ValueError("Value for lookup '%s' must be a list" % key)
-                    children = [self.__class__(**{field_path: v}) for v in value]
-                    self.children.append(self.__class__(*children, conn_type=self.OR))
-                    continue
-
-                # Filtering on list types is a bit quirky. The only lookup type I have found to work is:
-                #
-                #     item:Categories == 'foo' AND item:Categories == 'bar' AND ...
-                #
-                #     item:Categories == 'foo' OR item:Categories == 'bar' OR ...
-                #
-                # The former returns items that have all these categories, but maybe also others. The latter returns
-                # items that have at least one of these categories. This translates to the 'contains' and 'in' lookups.
-                # Both versions are case-insensitive.
-                #
-                # Exact matching and case-sensitive or partial-string matching is not possible since that requires the
-                # 'Contains' element which only supports matching on string elements, not arrays.
-                #
-                # Exact matching of categories (i.e. match ['a', 'b'] but not ['a', 'b', 'c']) could be implemented by
-                # post-processing items by fetch the categories field unconditionally and removing the items that don't
-                # have an exact match.
-                if lookup == self.LOOKUP_CONTAINS and is_iterable(value, generators_allowed=True):
-                    # '__contains' lookups on list field types
-                    children = [self.__class__(**{field_path: v}) for v in value]
-                    self.children.append(self.__class__(*children, conn_type=self.AND))
-                    continue
-                try:
-                    op = self._lookup_to_op(lookup)
-                except KeyError:
-                    raise ValueError("Lookup '%s' is not supported (called as '%s=%r')" % (lookup, key, value))
-            else:
-                field_path, op = key, self.EQ
-
-            if len(args) == 0 and len(kwargs) == 1:
-                # This is a single-kwarg Q object with a lookup that requires a single value. Make this a leaf
-                self.field_path = field_path
-                self.op = op
-                self.value = value
-                break
-
-            self.children.append(self.__class__(**{key: value}))
+            children = self._get_children_from_kwarg(key=key, value=value, is_single_kwarg=is_single_kwarg)
+            self.children.extend(children)
 
         if len(self.children) == 1 and self.field_path is None and self.conn_type != self.NOT:
             # We only have one child and no expression on ourselves, so we are a no-op. Flatten by taking over the child
@@ -158,9 +101,79 @@ class Q(object):
 
         self.clean()
 
+    def _get_children_from_kwarg(self, key, value, is_single_kwarg=False):
+        # Generates Q objects corresponding to a single keyword argument. Makes this a leaf if there are no children to
+        # generate.
+        key_parts = key.rsplit('__', 1)
+        if len(key_parts) == 2 and key_parts[1] in self.LOOKUP_TYPES:
+            # This is a kwarg with a lookup at the end
+            field_path, lookup = key_parts
+            if lookup == self.LOOKUP_EXISTS:
+                # value=True will fall through to further processing
+                if not value:
+                    return [~self.__class__(**{key: True})]
+
+            if lookup == self.LOOKUP_RANGE:
+                # EWS doesn't have a 'range' operator. Emulate 'foo__range=(1, 2)' as 'foo__gte=1 and foo__lte=2'
+                # (both values inclusive).
+                if len(value) != 2:
+                    raise ValueError("Value of lookup '%s' must have exactly 2 elements" % key)
+                return [
+                    self.__class__(**{'%s__gte' % field_path: value[0]}),
+                    self.__class__(**{'%s__lte' % field_path: value[1]}),
+                ]
+
+            if lookup == self.LOOKUP_IN:
+                # EWS doesn't have an '__in' operator. Allow '__in' lookups on list and non-list field types,
+                # specifying a list value. We'll emulate it as a set of OR'ed exact matches.
+                if not is_iterable(value, generators_allowed=True):
+                    raise ValueError("Value for lookup %r must be a list" % key)
+                children = [self.__class__(**{field_path: v}) for v in value]
+                return [self.__class__(*children, conn_type=self.OR)]
+
+            # Filtering on list types is a bit quirky. The only lookup type I have found to work is:
+            #
+            #     item:Categories == 'foo' AND item:Categories == 'bar' AND ...
+            #
+            #     item:Categories == 'foo' OR item:Categories == 'bar' OR ...
+            #
+            # The former returns items that have all these categories, but maybe also others. The latter returns
+            # items that have at least one of these categories. This translates to the 'contains' and 'in' lookups.
+            # Both versions are case-insensitive.
+            #
+            # Exact matching and case-sensitive or partial-string matching is not possible since that requires the
+            # 'Contains' element which only supports matching on string elements, not arrays.
+            #
+            # Exact matching of categories (i.e. match ['a', 'b'] but not ['a', 'b', 'c']) could be implemented by
+            # post-processing items by fetch the categories field unconditionally and removing the items that don't
+            # have an exact match.
+            if lookup == self.LOOKUP_CONTAINS and is_iterable(value, generators_allowed=True):
+                # '__contains' lookups on list field types
+                children = [self.__class__(**{field_path: v}) for v in value]
+                return [self.__class__(*children, conn_type=self.AND)]
+
+            try:
+                op = self._lookup_to_op(lookup)
+            except KeyError:
+                raise ValueError("Lookup '%s' is not supported (called as '%s=%r')" % (lookup, key, value))
+        else:
+            field_path, op = key, self.EQ
+
+        if not is_single_kwarg:
+            return [self.__class__(**{key: value})]
+
+        # This is a single-kwarg Q object with a lookup that requires a single value. Make this a leaf
+        self.field_path = field_path
+        self.op = op
+        self.value = value
+        return []
+
     def _promote(self):
         # Flatten by taking over the only child
-        assert len(self.children) == 1 and self.field_path is None
+        if len(self.children) != 1:
+            raise ValueError('Can only flatten when child count is 1')
+        if self.field_path is not None:
+            raise ValueError("Can only flatten when 'field_path' is not set")
         q = self.children[0]
         self.conn_type = q.conn_type
         self.field_path = q.field_path
@@ -173,25 +186,30 @@ class Q(object):
         if self.is_empty():
             return
         if self.query_string:
-            assert not any([self.field_path, self.op, self.value, self.children])
+            if any([self.field_path, self.op, self.value, self.children]):
+                raise ValueError('Query strings cannot be combined with other settings')
             return
-        assert self.conn_type in self.CONN_TYPES
+        if self.conn_type not in self.CONN_TYPES:
+            raise ValueError("'conn_type' %s must be one of %s" % (self.conn_type, self.CONN_TYPES))
         if not self.is_leaf():
             return
-        assert self.field_path
-        assert self.op in self.OP_TYPES
+        if not self.field_path:
+            raise ValueError("'field_path' must be set")
+        if self.op not in self.OP_TYPES:
+            raise ValueError("'op' %s must be one of %s" % (self.op, self.OP_TYPES))
         if self.op == self.EXISTS:
-            assert self.value is True
+            if self.value is not True:
+                raise ValueError("'value' must be True when operator is EXISTS")
         if self.value is None:
             raise ValueError('Value for filter on field path "%s" cannot be None' % self.field_path)
         if is_iterable(self.value, generators_allowed=True):
             raise ValueError(
-                'Value "%s" for filter on field path "%s" must be a single value' % (self.value, self.field_path)
+                'Value %r for filter on field path "%s" must be a single value' % (self.value, self.field_path)
             )
         try:
             value_to_xml_text(self.value)
         except NotImplementedError:
-            raise ValueError('Value "%s" for filter on field path "%s" is unsupported' % (self.value, self.field_path))
+            raise ValueError('Value %r for filter on field path "%s" is unsupported' % (self.value, self.field_path))
 
     @classmethod
     def _lookup_to_op(cls, lookup):
@@ -232,7 +250,9 @@ class Q(object):
         }
         if op in xml_tag_map:
             return create_element(xml_tag_map[op])
-        assert op in (cls.EXACT, cls.IEXACT, cls.CONTAINS, cls.ICONTAINS, cls.STARTSWITH, cls.ISTARTSWITH)
+        valid_ops = cls.EXACT, cls.IEXACT, cls.CONTAINS, cls.ICONTAINS, cls.STARTSWITH, cls.ISTARTSWITH
+        if op not in valid_ops:
+            raise ValueError("'op' %s must be one of %s" % (op, valid_ops))
 
         # For description of Contains attribute values, see
         #     https://msdn.microsoft.com/en-us/library/office/aa580702(v=exchg.150).aspx
@@ -262,7 +282,7 @@ class Q(object):
         elif op in (cls.STARTSWITH, cls.ISTARTSWITH):
             match_mode = 'Prefixed'
         else:
-            assert False
+            raise ValueError('Unsupported op: %s' % op)
         if op in (cls.IEXACT, cls.ICONTAINS, cls.ISTARTSWITH):
             compare_mode = 'IgnoreCase'
         else:
@@ -307,7 +327,7 @@ class Q(object):
         if issubclass(field_path.field.value_cls, MultiFieldIndexedElement) and not field_path.subfield:
             raise ValueError("Field path '%s' must contain a subfield" % self.field_path)
 
-    def to_xml(self, folder, version):
+    def to_xml(self, folders, version):
         if self.query_string:
             if version.build < EXCHANGE_2010:
                 raise NotImplementedError('QueryString filtering is only supported for Exchange 2010 servers and later')
@@ -315,14 +335,14 @@ class Q(object):
             elem.text = self.query_string
             return elem
         # Translate this Q object to a valid Restriction XML tree
-        elem = self.xml_elem(folder=folder, version=version)
+        elem = self.xml_elem(folders=folders, version=version)
         if elem is None:
             return None
         restriction = create_element('m:Restriction')
         restriction.append(elem)
         return restriction
 
-    def xml_elem(self, folder, version):
+    def xml_elem(self, folders, version):
         # Recursively build an XML tree structure of this Q object. If this is an empty leaf (the equivalent of Q()),
         # return None.
         from .fields import FieldPath
@@ -331,8 +351,15 @@ class Q(object):
             return None
         if self.is_leaf():
             elem = self._op_to_xml(self.op)
-            field_path = FieldPath.from_string(self.field_path, folder=folder)
-            self._validate_field_path(field_path=field_path, folder=folder)
+            for folder in folders:
+                try:
+                    field_path = FieldPath.from_string(self.field_path, folder=folder)
+                except ValueError:
+                    continue
+                self._validate_field_path(field_path=field_path, folder=folder)
+                break
+            else:
+                raise ValueError("Unknown fieldname '%s' on folders '%s'" % (self.field_path, folders))
             if self.op == self.EXISTS:
                 value = self.value
             else:
@@ -357,12 +384,15 @@ class Q(object):
                     uriorconst = create_element('t:FieldURIOrConstant')
                     uriorconst.append(constant)
                     elem.append(uriorconst)
+        elif len(self.children) == 1:
+            # We have only one child
+            elem = self.children[0].xml_elem(folders=folders, version=version)
         else:
             # We have multiple children. If conn_type is NOT, then group children with AND. We'll add the NOT later
             elem = self._conn_to_xml(self.AND if self.conn_type == self.NOT else self.conn_type)
             # Sort children by field name so we get stable output (for easier testing). Children should never be empty
             for c in sorted(self.children, key=lambda i: i.field_path or ''):
-                elem.append(c.xml_elem(folder=folder, version=version))
+                elem.append(c.xml_elem(folders=folders, version=version))
         if elem is None:
             return None  # Should not be necessary, but play safe
         if self.conn_type == self.NOT:
@@ -412,8 +442,11 @@ class Q(object):
     def __eq__(self, other):
         return repr(self) == repr(other)
 
+    def __hash__(self):
+        return hash(repr(self))
+
     def __str__(self):
-        return self.expr()
+        return self.expr() or 'Q()'
 
     def __repr__(self):
         if self.is_leaf():
@@ -433,17 +466,20 @@ class Restriction(object):
 
     """
 
-    def __init__(self, q, folder):
-        assert isinstance(q, Q)
+    def __init__(self, q, folders):
+        if not isinstance(q, Q):
+            raise ValueError("'q' value %r must be a Q instance" % q)
         if q.is_empty():
             raise ValueError("Q object must not be empty")
         from .folders import Folder
-        assert isinstance(folder, Folder)
+        for folder in folders:
+            if not isinstance(folder, Folder):
+                raise ValueError("'folder' value %r must be a Folder instance" % folder)
         self.q = q
-        self.folder = folder
+        self.folders = folders
 
     def to_xml(self, version):
-        return self.q.to_xml(folder=self.folder, version=version)
+        return self.q.to_xml(folders=self.folders, version=version)
 
     def __str__(self):
         """

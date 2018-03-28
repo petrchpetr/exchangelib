@@ -1,27 +1,27 @@
 """ A dict to translate from pytz location name to Windows timezone name. Translations taken from
 http://unicode.org/repos/cldr/trunk/common/supplemental/windowsZones.xml """
+import requests
+
+from .util import to_xml
 
 CLDR_WINZONE_URL = 'http://unicode.org/repos/cldr/trunk/common/supplemental/windowsZones.xml'
 
 
 def generate_map():
     """ Helper method to update the map if the CLDR database is updated """
-    import requests
-    from xml.etree.ElementTree import fromstring
-
     r = requests.get(CLDR_WINZONE_URL)
-    assert r.status_code == 200
+    if r.status_code != 200:
+        raise ValueError('Unexpected response: %s' % r)
     tz_map = {}
-    for e in fromstring(r.content).find('windowsZones').find('mapTimezones').findall('mapZone'):
+    for e in to_xml(r.text).find('windowsZones').find('mapTimezones').findall('mapZone'):
         for location in e.get('type').split(' '):
             tz_map[location] = e.get('other')
-    # Add some missing but helpful translations
-    tz_map['UTC'] = str('UTC')
-    tz_map['GMT'] = str('GMT Standard Time')
     return tz_map
 
 
-PYTZ_TO_MS_TIMEZONE_MAP = {
+# This map is generated irregularly from generate_map(). Do not edit manually - make corrections to
+# PYTZ_TO_MS_TIMEZONE_MAP instead. We provide this map to avoid hammering the CLDR_WINZONE_URL.
+CLDR_TO_MS_TIMEZONE_MAP = {
     'Africa/Abidjan': 'Greenwich Standard Time',
     'Africa/Accra': 'Greenwich Standard Time',
     'Africa/Addis_Ababa': 'E. Africa Standard Time',
@@ -49,7 +49,7 @@ PYTZ_TO_MS_TIMEZONE_MAP = {
     'Africa/Johannesburg': 'South Africa Standard Time',
     'Africa/Juba': 'E. Africa Standard Time',
     'Africa/Kampala': 'E. Africa Standard Time',
-    'Africa/Khartoum': 'E. Africa Standard Time',
+    'Africa/Khartoum': 'Sudan Standard Time',
     'Africa/Kigali': 'South Africa Standard Time',
     'Africa/Kinshasa': 'W. Central Africa Standard Time',
     'Africa/Lagos': 'W. Central Africa Standard Time',
@@ -70,7 +70,7 @@ PYTZ_TO_MS_TIMEZONE_MAP = {
     'Africa/Nouakchott': 'Greenwich Standard Time',
     'Africa/Ouagadougou': 'Greenwich Standard Time',
     'Africa/Porto-Novo': 'W. Central Africa Standard Time',
-    'Africa/Sao_Tome': 'Greenwich Standard Time',
+    'Africa/Sao_Tome': 'W. Central Africa Standard Time',
     'Africa/Tripoli': 'Libya Standard Time',
     'Africa/Tunis': 'W. Central Africa Standard Time',
     'Africa/Windhoek': 'Namibia Standard Time',
@@ -428,7 +428,6 @@ PYTZ_TO_MS_TIMEZONE_MAP = {
     'Europe/Zagreb': 'Central European Standard Time',
     'Europe/Zaporozhye': 'FLE Standard Time',
     'Europe/Zurich': 'W. Europe Standard Time',
-    'GMT': 'GMT Standard Time',
     'Indian/Antananarivo': 'E. Africa Standard Time',
     'Indian/Chagos': 'Central Asia Standard Time',
     'Indian/Christmas': 'SE Asia Standard Time',
@@ -481,5 +480,20 @@ PYTZ_TO_MS_TIMEZONE_MAP = {
     'Pacific/Truk': 'West Pacific Standard Time',
     'Pacific/Wake': 'UTC+12',
     'Pacific/Wallis': 'UTC+12',
-    'UTC': 'UTC',
 }
+
+# Add timezone names used by pytz (which gets timezone names from IANA) that are not found in the CLDR.
+# TODO: A full list of the IANA names missing in CLDR can be found with:
+#
+#    sorted(set(pytz.all_timezones) - set(CLDR_TO_MS_TIMEZONE_MAP))
+#
+PYTZ_TO_MS_TIMEZONE_MAP = dict(CLDR_TO_MS_TIMEZONE_MAP, **{
+    'Asia/Kolkata': 'India Standard Time',
+    'UTC': 'UTC',
+    'GMT': 'GMT Standard Time',
+})
+
+# Reverse map from Microsoft timezone ID to pytz timezone name. Non-CLDR timezone ID's can be added here.
+MS_TIMEZONE_TO_PYTZ_MAP = dict(dict((v, k) for k, v in PYTZ_TO_MS_TIMEZONE_MAP.items()), **{
+    'tzone://Microsoft/Utc': 'UTC',
+})

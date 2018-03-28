@@ -1,7 +1,12 @@
 #!/usr/bin/env python
 """
-To upload to PyPI:
-   python setup.py sdist bdist_wheel upload
+Release notes:
+* Bump version in setup.py
+* Bump version and date in README.rst
+* Bump version in CHANGELOG.rst
+* Commit and push changes
+* Push to PyPI: python setup.py sdist bdist_wheel upload
+* Create release on GitHub
 """
 import io
 import os
@@ -15,15 +20,16 @@ def read(fname):
 
 setup(
     name='exchangelib',
-    version='1.9.4',
+    version='1.10.7',
     author='Erik Cederstrand',
     author_email='erik@cederstrand.dk',
     description='Client for Microsoft Exchange Web Services (EWS)',
     long_description=read('README.rst'),
     license='BSD',
     keywords='Exchange EWS autodiscover',
-    install_requires=['requests>=2.7', 'requests_ntlm>=0.2.0', 'dnspython>=1.14.0', 'pytz', 'lxml',
-                      'cached_property', 'future', 'six', 'tzlocal', 'python-dateutil'],
+    install_requires=['requests>=2.7', 'requests_ntlm>=0.2.0', 'dnspython>=1.14.0', 'pytz', 'lxml>3.0',
+                      'cached_property', 'future', 'six', 'tzlocal', 'python-dateutil', 'pygments', 'defusedxml',
+                      'isodate'],
     packages=['exchangelib'],
     tests_require=['PyYAML', 'requests_mock', 'psutil'],
     test_suite='tests',

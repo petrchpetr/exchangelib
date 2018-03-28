@@ -57,8 +57,8 @@ class ExtendedProperty(EWSElement):
         # 'ObjectArray',
         'Short',
         'ShortArray',
-        # 'SystemTime',  # Not implemented yet
-        # 'SystemTimeArray',  # Not implemented yet
+        'SystemTime',
+        'SystemTimeArray',
         'String',
         'StringArray',
     }  # The commented-out types cannot be used for setting or getting (see docs) and are thus not very useful here
@@ -68,7 +68,7 @@ class ExtendedProperty(EWSElement):
     property_tag = None  # hex integer (e.g. 0x8000) or string ('0x8000')
     property_name = None
     property_id = None  # integer as hex-formatted int (e.g. 0x8000) or normal int (32768)
-    property_type = None
+    property_type = ''
 
     __slots__ = ('value',)
 
@@ -79,38 +79,96 @@ class ExtendedProperty(EWSElement):
         self.value = kwargs.pop('value')
         super(ExtendedProperty, self).__init__(**kwargs)
 
-    def clean(self, version=None):
-        if self.distinguished_property_set_id:
-            assert not any([self.property_set_id, self.property_tag])
-            assert any([self.property_id, self.property_name])
-            assert self.distinguished_property_set_id in self.DISTINGUISHED_SETS
-        if self.property_set_id:
-            assert not any([self.distinguished_property_set_id, self.property_tag])
-            assert any([self.property_id, self.property_name])
-        if self.property_tag:
-            assert not any([
-                self.distinguished_property_set_id, self.property_set_id, self.property_name, self.property_id
-            ])
-            if 0x8000 <= self.property_tag_as_int() <= 0xFFFE:
-                raise ValueError(
-                    "'property_tag' value '%s' is reserved for custom properties" % self.property_tag_as_hex()
-                )
-        if self.property_name:
-            assert not any([self.property_id, self.property_tag])
-            assert any([self.distinguished_property_set_id, self.property_set_id])
-        if self.property_id:
-            assert not any([self.property_name, self.property_tag])
-            assert any([self.distinguished_property_set_id, self.property_set_id])
-        assert self.property_type in self.PROPERTY_TYPES
+    @classmethod
+    def validate_cls(cls):
+        # Validate values of class attributes and their inter-dependencies
+        cls._validate_distinguished_property_set_id()
+        cls._validate_property_set_id()
+        cls._validate_property_tag()
+        cls._validate_property_name()
+        cls._validate_property_id()
+        cls._validate_property_type()
 
+    @classmethod
+    def _validate_distinguished_property_set_id(cls):
+        if cls.distinguished_property_set_id:
+            if any([cls.property_set_id, cls.property_tag]):
+                raise ValueError(
+                    "When 'distinguished_property_set_id' is set, 'property_set_id' and 'property_tag' must be None"
+                )
+            if not any([cls.property_id, cls.property_name]):
+                raise ValueError(
+                    "When 'distinguished_property_set_id' is set, 'property_id' or 'property_name' must also be set"
+                )
+            if cls.distinguished_property_set_id not in cls.DISTINGUISHED_SETS:
+                raise ValueError(
+                    "'distinguished_property_set_id' value '%s' must be one of %s"
+                    % (cls.distinguished_property_set_id, sorted(cls.DISTINGUISHED_SETS))
+                )
+
+    @classmethod
+    def _validate_property_set_id(cls):
+        if cls.property_set_id:
+            if any([cls.distinguished_property_set_id, cls.property_tag]):
+                raise ValueError(
+                    "When 'property_set_id' is set, 'distinguished_property_set_id' and 'property_tag' must be None"
+                )
+            if not any([cls.property_id, cls.property_name]):
+                raise ValueError(
+                    "When 'property_set_id' is set, 'property_id' or 'property_name' must also be set"
+                )
+
+    @classmethod
+    def _validate_property_tag(cls):
+        if cls.property_tag:
+            if any([
+                cls.distinguished_property_set_id, cls.property_set_id, cls.property_name, cls.property_id
+            ]):
+                raise ValueError("When 'property_tag' is set, only 'property_type' must be set")
+            if 0x8000 <= cls.property_tag_as_int() <= 0xFFFE:
+                raise ValueError(
+                    "'property_tag' value '%s' is reserved for custom properties" % cls.property_tag_as_hex()
+                )
+
+    @classmethod
+    def _validate_property_name(cls):
+        if cls.property_name:
+            if any([cls.property_id, cls.property_tag]):
+                raise ValueError("When 'property_name' is set, 'property_id' and 'property_tag' must be None")
+            if not any([cls.distinguished_property_set_id, cls.property_set_id]):
+                raise ValueError(
+                    "When 'property_name' is set, 'distinguished_property_set_id' or 'property_set_id' must also be set"
+                )
+
+    @classmethod
+    def _validate_property_id(cls):
+        if cls.property_id:
+            if any([cls.property_name, cls.property_tag]):
+                raise ValueError("When 'property_id' is set, 'property_name' and 'property_tag' must be None")
+            if not any([cls.distinguished_property_set_id, cls.property_set_id]):
+                raise ValueError(
+                    "When 'property_id' is set, 'distinguished_property_set_id' or 'property_set_id' must also be set"
+                )
+
+    @classmethod
+    def _validate_property_type(cls):
+        if cls.property_type not in cls.PROPERTY_TYPES:
+            raise ValueError(
+                "'property_type' value '%s' must be one of %s" % (cls.property_type, sorted(cls.PROPERTY_TYPES))
+            )
+
+    def clean(self, version=None):
+        self.validate_cls()
         python_type = self.python_type()
         if self.is_array_type():
             if not is_iterable(self.value):
-                raise ValueError("'%s' value '%s' must be a list" % (self.__class__.__name__, self.value))
+                raise ValueError("'%s' value %r must be a list" % (self.__class__.__name__, self.value))
             for v in self.value:
-                assert isinstance(v, python_type)
+                if not isinstance(v, python_type):
+                    raise ValueError("'value' element %r must be an instance of %s" % (v, python_type))
         else:
-            assert isinstance(self.value, python_type)
+            if not isinstance(self.value, python_type):
+                raise ValueError("'value' %r must be an instance of %s" % (self.value, python_type))
 
     @classmethod
     def from_xml(cls, elem, account):
@@ -120,11 +178,10 @@ class ExtendedProperty(EWSElement):
             values = elem.find('{%s}Values' % TNS)
             if cls.is_binary_type():
                 return [base64.b64decode(val) for val in get_xml_attrs(values, '{%s}Value' % TNS)]
-            else:
-                return [
-                    xml_text_to_value(value=val, value_type=python_type)
-                    for val in get_xml_attrs(values, '{%s}Value' % TNS)
-                ]
+            return [
+                xml_text_to_value(value=val, value_type=python_type)
+                for val in get_xml_attrs(values, '{%s}Value' % TNS)
+            ]
         if cls.is_binary_type():
             return base64.b64decode(get_xml_attr(elem, '{%s}Value' % TNS))
         extended_field_value = xml_text_to_value(value=get_xml_attr(elem, '{%s}Value' % TNS), value_type=python_type)
@@ -149,12 +206,12 @@ class ExtendedProperty(EWSElement):
 
     @classmethod
     def is_array_type(cls):
-        return cls.property_type and cls.property_type.endswith('Array')
+        return cls.property_type.endswith('Array')
 
     @classmethod
     def is_binary_type(cls):
         # We can't just test python_type() == bytes, because str == bytes in Python2
-        return cls.property_type and 'Binary' in cls.property_type
+        return 'Binary' in cls.property_type
 
     @classmethod
     def property_tag_as_int(cls):

@@ -16,18 +16,18 @@ machine       office365
 
 You can keep the notifier running by adding this to your shell startup script:
      start-stop-daemon \
-         --pid ~/office365-notifier/notify.pid \
+         --pidfile ~/office365-notifier/notify.pid \
          --make-pidfile --start --background \
          --startas ~/office365-notifier/notify.sh
 
 Where `~/office365-notifier/notify.sh` contains this:
 
-cd  ~/office365-notifier
+cd "$( dirname "$0" )"
 if [ ! -d "office365_env" ]; then
     virtualenv -p python3 office365_env
 fi
 source office365_env/bin/activate
-pip3 install sh bs4 exchangelib > /dev/null
+pip3 install sh exchangelib > /dev/null
 
 sleep=${1:-600}
 while true
@@ -43,12 +43,14 @@ import sys
 import warnings
 
 from exchangelib import DELEGATE, Credentials, Account, EWSTimeZone, UTC_NOW
-
-from bs4 import BeautifulSoup
 import sh
 
-# Disable insecure SSL warnings
-warnings.filterwarnings("ignore")
+if '--insecure' in sys.argv:
+    # Disable SSL when Office365 can't get their certificate act together
+    from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
+    BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
+    # Disable insecure SSL warnings
+    warnings.filterwarnings("ignore")
 
 # Use notify-send for email notifications and zenity for calendar notifications
 notify = sh.Command('/usr/bin/notify-send')
@@ -63,7 +65,7 @@ emails_since = now - timedelta(seconds=sleep)
 cal_items_before = now + timedelta(seconds=sleep * 4)  # Longer notice of upcoming appointments than new emails
 username, _, password = netrc().authenticators('office365')
 c = Credentials(username, password)
-a = Account(primary_smtp_address=c.username, credentials=c, access_type=DELEGATE, autodiscover=True, verify_ssl=False)
+a = Account(primary_smtp_address=c.username, credentials=c, access_type=DELEGATE, autodiscover=True)
 
 for msg in a.calendar.view(start=now, end=cal_items_before)\
         .only('start', 'end', 'subject', 'location')\
@@ -81,11 +83,8 @@ for msg in a.calendar.view(start=now, end=cal_items_before)\
     zenity(**{'info': None, 'no-markup': None, 'title': subj, 'text': body})
 
 for msg in a.inbox.filter(datetime_received__gt=emails_since, is_read=False)\
-        .only('datetime_received', 'subject', 'body')\
-        .order_by('datetime_received',):
+        .only('datetime_received', 'subject', 'text_body')\
+        .order_by('datetime_received')[:10]:
     subj = 'New mail: %s' % msg.subject
-    body = BeautifulSoup(msg.body)
-    for s in body(['script', 'style']):
-        s.extract()
-    clean_body = '\n'.join(l for l in body.text.split('\n') if l)
+    clean_body = '\n'.join(l for l in msg.text_body.split('\n') if l)
     notify(subj, clean_body[:200])

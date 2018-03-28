@@ -2,59 +2,77 @@
 from collections import namedtuple
 import datetime
 from decimal import Decimal
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import glob
 from itertools import chain
 import io
 from keyword import kwlist
+import logging
 import os
-import psutil
 import random
 import socket
 import string
+import tempfile
 import time
 import unittest
-from xml.etree.ElementTree import ParseError
+import warnings
 
+from dateutil.relativedelta import relativedelta
+from defusedxml.ElementTree import ParseError
+from defusedxml.lxml import parse, tostring
+import dns.resolver
+import psutil
+import pytz
 import requests
 import requests_mock
 from six import PY2, string_types
-from yaml import load
+from yaml import safe_load
 
 from exchangelib import close_connections
 from exchangelib.account import Account, SAVE_ONLY, SEND_ONLY, SEND_AND_SAVE_COPY
 from exchangelib.attachments import FileAttachment, ItemAttachment
 from exchangelib.autodiscover import AutodiscoverProtocol, discover
+import exchangelib.autodiscover
 from exchangelib.configuration import Configuration
 from exchangelib.credentials import DELEGATE, IMPERSONATION, Credentials, ServiceAccount
 from exchangelib.errors import RelativeRedirect, ErrorItemNotFound, ErrorInvalidOperation, AutoDiscoverRedirect, \
     AutoDiscoverCircularRedirect, AutoDiscoverFailed, ErrorNonExistentMailbox, UnknownTimeZone, \
     ErrorNameResolutionNoResults, TransportError, RedirectError, CASError, RateLimitError, UnauthorizedError, \
     ErrorInvalidChangeKey, ErrorInvalidIdMalformed, ErrorContainsFilterWrongType, ErrorAccessDenied, \
-    ErrorFolderNotFound, ErrorInvalidRequest, SOAPError, ErrorInvalidServerVersion, NaiveDateTimeNotAllowed
+    ErrorFolderNotFound, ErrorInvalidRequest, SOAPError, ErrorInvalidServerVersion, NaiveDateTimeNotAllowed, \
+    AmbiguousTimeError, NonExistentTimeError, ErrorUnsupportedPathForQuery, ErrorInvalidPropertyForOperation, \
+    ErrorInvalidValueForProperty, ErrorPropertyUpdate, ErrorDeleteDistinguishedFolder, \
+    ErrorNoPublicFolderReplicaAvailable, ErrorServerBusy, ErrorInvalidPropertySet
 from exchangelib.ewsdatetime import EWSDateTime, EWSDate, EWSTimeZone, UTC, UTC_NOW
 from exchangelib.extended_properties import ExtendedProperty, ExternId
-from exchangelib.fields import BooleanField, IntegerField, DecimalField, TextField, EmailField, URIField, ChoiceField, \
-    BodyField, DateTimeField, Base64Field, PhoneNumberField, EmailAddressField, \
-    PhysicalAddressField, ExtendedPropertyField, MailboxField, AttendeesField, AttachmentField, TextListField, \
-    MailboxListField, Choice, FieldPath, EWSElementField
+from exchangelib.fields import BooleanField, IntegerField, DecimalField, TextField, EmailAddressField, URIField, \
+    ChoiceField, BodyField, DateTimeField, Base64Field, PhoneNumberField, EmailAddressesField, TimeZoneField, \
+    PhysicalAddressField, ExtendedPropertyField, MailboxField, AttendeesField, AttachmentField, CharListField, \
+    MailboxListField, Choice, FieldPath, EWSElementField, CultureField, DateField, EnumField, EnumListField, IdField, \
+    CharField, TextListField, MONDAY, WEDNESDAY, FEBRUARY, AUGUST, SECOND, LAST, DAY, WEEK_DAY, WEEKEND_DAY
 from exchangelib.folders import Calendar, DeletedItems, Drafts, Inbox, Outbox, SentItems, JunkEmail, Messages, Tasks, \
-    Contacts, Folder
-from exchangelib.indexed_properties import IndexedElement, EmailAddress, PhysicalAddress, PhoneNumber, \
+    Contacts, Folder, RecipientCache, GALContacts, System, AllContacts, MyContactsExtended, Reminders, Favorites, \
+    AllItems, ConversationSettings, Friends, RSSFeeds, Sharing, IMContactList, QuickContacts, Journal, Notes, \
+    SyncIssues, MyContacts, ToDoSearch, FolderCollection
+from exchangelib.indexed_properties import EmailAddress, PhysicalAddress, PhoneNumber, \
     SingleFieldIndexedElement, MultiFieldIndexedElement
-from exchangelib.items import Item, CalendarItem, Message, Contact, Task, DistributionList, ALL_OCCURRENCIES
-from exchangelib.properties import Attendee, Mailbox, RoomList, MessageHeader, Room, ItemId, Member, EWSElement
-from exchangelib.protocol import Protocol
+from exchangelib.items import Item, CalendarItem, Message, Contact, Task, DistributionList
+from exchangelib.properties import Attendee, Mailbox, RoomList, MessageHeader, Room, ItemId, Member, EWSElement, Body, \
+    HTMLBody, TimeZone, FreeBusyView
+from exchangelib.protocol import BaseProtocol, Protocol, NoVerifyHTTPAdapter
 from exchangelib.queryset import QuerySet, DoesNotExist, MultipleObjectsReturned
 from exchangelib.recurrence import Recurrence, AbsoluteYearlyPattern, RelativeYearlyPattern, AbsoluteMonthlyPattern, \
     RelativeMonthlyPattern, WeeklyPattern, DailyPattern, FirstOccurrence, LastOccurrence, Occurrence, \
-    DeletedOccurrence, NoEndPattern, EndDatePattern, NumberedPattern
+    NoEndPattern, EndDatePattern, NumberedPattern, ExtraWeekdaysField
 from exchangelib.restriction import Restriction, Q
+from exchangelib.settings import OofSettings
 from exchangelib.services import GetServerTimeZones, GetRoomLists, GetRooms, GetAttachment, ResolveNames, TNS
 from exchangelib.transport import NOAUTH, BASIC, DIGEST, NTLM, wrap, _get_auth_method_from_response
-from exchangelib.util import chunkify, peek, get_redirect_url, to_xml, BOM, get_domain, \
-    post_ratelimited, create_element, CONNECTION_ERRORS
-from exchangelib.version import Build, Version, EXCHANGE_2007, EXCHANGE_2010, EXCHANGE_2013, EXCHANGE_2016
-from exchangelib.winzone import generate_map, PYTZ_TO_MS_TIMEZONE_MAP
+from exchangelib.util import chunkify, peek, get_redirect_url, to_xml, BOM, get_domain, value_to_xml_text, \
+    post_ratelimited, create_element, CONNECTION_ERRORS, PrettyXmlHandler, xml_to_str
+from exchangelib.version import Build, Version, EXCHANGE_2007, EXCHANGE_2010, EXCHANGE_2013
+from exchangelib.winzone import generate_map, CLDR_TO_MS_TIMEZONE_MAP
 
 if PY2:
     FileNotFoundError = OSError
@@ -66,11 +84,12 @@ mock_protocol = namedtuple('mock_protocol', ('version', 'service_endpoint'))
 mock_version = namedtuple('mock_version', ('build',))
 
 
-def mock_post(url, status_code, headers, text):
+def mock_post(url, status_code, headers, text=''):
     req = namedtuple('request', ['headers'])(headers={})
+    c = text.encode('utf-8')
     return lambda **kwargs: namedtuple(
-        'response', ['status_code', 'headers', 'text', 'request', 'history', 'url']
-    )(status_code=status_code, headers=headers, text=text, request=req, history=None, url=url)
+        'response', ['status_code', 'headers', 'text', 'content', 'request', 'history', 'url']
+    )(status_code=status_code, headers=headers, text=text, content=c, request=req, history=None, url=url)
 
 
 def mock_session_exception(exc_cls):
@@ -108,9 +127,9 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(Build(15, 0, 1, 1).api_version(), 'Exchange2013')
         self.assertEqual(Build(15, 0, 1, 1).api_version(), 'Exchange2013')
         self.assertEqual(Build(15, 0, 847, 0).api_version(), 'Exchange2013_SP1')
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ValueError):
             Build(16, 0).api_version()
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ValueError):
             Build(15, 4).api_version()
 
 
@@ -133,7 +152,7 @@ class VersionTest(unittest.TestCase):
         MajorBuildNumber="845" MajorVersion="15" MinorBuildNumber="22" MinorVersion="1" Version="V2016_10_10"
         xmlns:h="http://schemas.microsoft.com/exchange/services/2006/types"/>
 </s:Header>
-</s:Envelope'''
+</s:Envelope>'''
         )
         self.assertEqual(version.api_version, EXCHANGE_2007.api_version())
         self.assertEqual(version.api_version, 'Exchange2007')
@@ -150,7 +169,7 @@ class VersionTest(unittest.TestCase):
         MajorBuildNumber="845" MajorVersion="15" MinorBuildNumber="22" MinorVersion="1" Version="HELLO_FROM_EXCHANGELIB"
         xmlns:h="http://schemas.microsoft.com/exchange/services/2006/types"/>
 </s:Header>
-</s:Envelope'''
+</s:Envelope>'''
         )
         self.assertEqual(version.api_version, 'HELLO_FROM_EXCHANGELIB')
 
@@ -166,7 +185,7 @@ class VersionTest(unittest.TestCase):
         MajorBuildNumber="845" MajorVersion="15" MinorBuildNumber="22" MinorVersion="1"
         xmlns:h="http://schemas.microsoft.com/exchange/services/2006/types"/>
 </s:Header>
-</s:Envelope'''
+</s:Envelope>'''
         )
         self.assertEqual(version.api_version, 'Exchange2016')
 
@@ -182,7 +201,7 @@ class VersionTest(unittest.TestCase):
         MajorBuildNumber="845" MajorVersion="15" MinorBuildNumber="22" MinorVersion="1"
         xmlns:h="http://schemas.microsoft.com/exchange/services/2006/types"/>
 </s:Header>
-</s:Envelope'''
+</s:Envelope>'''
         )
         self.assertEqual(version.api_version, 'Exchange2016')
 
@@ -198,7 +217,7 @@ class VersionTest(unittest.TestCase):
                 '''\
 <?xml version="1.0" ?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
-</s:Envelope'''
+</s:Envelope>'''
             )
         with self.assertRaises(TransportError):
             Version.from_response(
@@ -208,7 +227,7 @@ class VersionTest(unittest.TestCase):
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
 <s:Header>
 </s:Header>
-</s:Envelope'''
+</s:Envelope>'''
             )
         with self.assertRaises(TransportError):
             Version.from_response(
@@ -220,11 +239,23 @@ class VersionTest(unittest.TestCase):
     <h:ServerVersionInfo MajorBuildNumber="845" MajorVersion="15" Version="V2016_10_10"
         xmlns:h="http://schemas.microsoft.com/exchange/services/2006/types"/>
 </s:Header>
-</s:Envelope'''
+</s:Envelope>'''
             )
 
 
 class ConfigurationTest(unittest.TestCase):
+    def test_magic(self):
+        config = Configuration(
+            server='example.com',
+            has_ssl=True,
+            credentials=Credentials('foo', 'bar'),
+            auth_type=NTLM,
+            version=Version(build=Build(15, 1, 2, 3), api_version='foo'),
+        )
+        # Just test that these work
+        str(config)
+        repr(config)
+
     @requests_mock.mock()  # Just to make sure we don't make any requests
     def test_hardcode_all(self, m):
         # Test that we can hardcode everything without having a working server. This is useful if neither tasting or
@@ -234,7 +265,6 @@ class ConfigurationTest(unittest.TestCase):
             has_ssl=True,
             credentials=Credentials('foo', 'bar'),
             auth_type=NTLM,
-            verify_ssl=True,
             version=Version(build=Build(15, 1, 2, 3), api_version='foo'),
         )
 
@@ -245,21 +275,21 @@ class ProtocolTest(unittest.TestCase):
     def test_session(self, m):
         m.get('https://example.com/EWS/types.xsd', status_code=200)
         protocol = Protocol(service_endpoint='https://example.com/Foo.asmx', credentials=Credentials('A', 'B'),
-                            auth_type=NTLM, verify_ssl=True, version=Version(Build(15, 1)))
+                            auth_type=NTLM, version=Version(Build(15, 1)))
         session = protocol.create_session()
         new_session = protocol.renew_session(session)
         self.assertNotEqual(id(session), id(new_session))
 
     @requests_mock.mock()
     def test_protocol_instance_caching(self, m):
-        # Verify that we get the same Protocol instance for the same combination of (endpoint, credentials, verify_ssl)
+        # Verify that we get the same Protocol instance for the same combination of (endpoint, credentials)
         m.get('https://example.com/EWS/types.xsd', status_code=200)
         base_p = Protocol(service_endpoint='https://example.com/Foo.asmx', credentials=Credentials('A', 'B'),
-                          auth_type=NTLM, verify_ssl=True, version=Version(Build(15, 1)))
+                          auth_type=NTLM, version=Version(Build(15, 1)))
 
         for i in range(10):
             p = Protocol(service_endpoint='https://example.com/Foo.asmx', credentials=Credentials('A', 'B'),
-                         auth_type=NTLM, verify_ssl=True, version=Version(Build(15, 1)))
+                         auth_type=NTLM, version=Version(Build(15, 1)))
             self.assertEqual(base_p, p)
             self.assertEqual(id(base_p), id(p))
             self.assertEqual(hash(base_p), hash(p))
@@ -270,7 +300,7 @@ class ProtocolTest(unittest.TestCase):
         proc = psutil.Process()
         ip_addr = socket.gethostbyname('example.com')
         protocol = Protocol(service_endpoint='http://example.com', credentials=Credentials('A', 'B'),
-                            auth_type=NOAUTH, verify_ssl=True, version=Version(Build(15, 1)))
+                            auth_type=NOAUTH, version=Version(Build(15, 1)))
         session = protocol.get_session()
         session.get('http://example.com')
         self.assertEqual([p.raddr[0] for p in proc.connections() if p.raddr[0] == ip_addr], [ip_addr])
@@ -334,12 +364,35 @@ class EWSDateTimeTest(unittest.TestCase):
             EWSTimeZone.timezone('UNKNOWN')
 
         # Test timezone known by pytz but with no Winzone mapping
-        import pytz
         tz = pytz.timezone('Africa/Tripoli')
         # This hack smashes the pytz timezone cache. Don't reuse the original timezone name for other tests
         tz.zone = 'UNKNOWN'
-        with self.assertRaises(ValueError):
+        with self.assertRaises(UnknownTimeZone):
             EWSTimeZone.from_pytz(tz)
+
+    def test_localize(self):
+        # Test some cornercases around DST
+        tz = EWSTimeZone.timezone('Europe/Copenhagen')
+        self.assertEqual(
+            str(tz.localize(EWSDateTime(2023, 10, 29, 2, 36, 0))),
+            '2023-10-29 02:36:00+01:00'
+        )
+        with self.assertRaises(AmbiguousTimeError):
+            tz.localize(EWSDateTime(2023, 10, 29, 2, 36, 0), is_dst=None)
+        self.assertEqual(
+            str(tz.localize(EWSDateTime(2023, 10, 29, 2, 36, 0), is_dst=True)),
+            '2023-10-29 02:36:00+02:00'
+        )
+        self.assertEqual(
+            str(tz.localize(EWSDateTime(2023, 3, 26, 2, 36, 0))),
+            '2023-03-26 02:36:00+01:00'
+        )
+        with self.assertRaises(NonExistentTimeError):
+            tz.localize(EWSDateTime(2023, 3, 26, 2, 36, 0), is_dst=None)
+        self.assertEqual(
+            str(tz.localize(EWSDateTime(2023, 3, 26, 2, 36, 0), is_dst=True)),
+            '2023-03-26 02:36:00+02:00'
+        )
 
     def test_ewsdatetime(self):
         # Test a static timezone
@@ -398,11 +451,12 @@ class EWSDateTimeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             EWSDateTime(2000, 1, 1, tzinfo=tz)
         # Test normalize, for completeness
-        self.assertEqual(tz.normalize(tz.localize(EWSDateTime(2000, 1, 1))).ewsformat(), '2000-01-01T00:00:00+01:00')
+        self.assertEqual(tz.normalize(dt).ewsformat(), '2000-08-02T03:04:05+02:00')
+        self.assertEqual(utc_tz.normalize(dt, is_dst=True).ewsformat(), '2000-08-02T01:04:05Z')
 
     def test_generate(self):
         try:
-            self.assertDictEqual(generate_map(), PYTZ_TO_MS_TIMEZONE_MAP)
+            self.assertDictEqual(generate_map(), CLDR_TO_MS_TIMEZONE_MAP)
         except CONNECTION_ERRORS:
             # generate_map() requires access to unicode.org, which may be unavailable. Don't fail test, since this is
             # out of our control.
@@ -492,6 +546,32 @@ class PropertiesTest(unittest.TestCase):
         mbx.item_id = 'YYY'
         self.assertEqual(hash(mbx), hash('YYY'))  # If we have an item_id, use that for uniqueness
 
+    def test_body(self):
+        # Test that string formatting a Body and HTMLBody instance works and keeps the type
+        self.assertEqual(str(Body('foo')), 'foo')
+        self.assertEqual(str(Body('%s') % 'foo'), 'foo')
+        self.assertEqual(str(Body('{}').format('foo')), 'foo')
+
+        self.assertIsInstance(Body('foo'), Body)
+        self.assertIsInstance(Body('') + 'foo', Body)
+        foo = Body('')
+        foo += 'foo'
+        self.assertIsInstance(foo, Body)
+        self.assertIsInstance(Body('%s') % 'foo', Body)
+        self.assertIsInstance(Body('{}').format('foo'), Body)
+
+        self.assertEqual(str(HTMLBody('foo')), 'foo')
+        self.assertEqual(str(HTMLBody('%s') % 'foo'), 'foo')
+        self.assertEqual(str(HTMLBody('{}').format('foo')), 'foo')
+
+        self.assertIsInstance(HTMLBody('foo'), HTMLBody)
+        self.assertIsInstance(HTMLBody('') + 'foo', HTMLBody)
+        foo = HTMLBody('')
+        foo += 'foo'
+        self.assertIsInstance(foo, HTMLBody)
+        self.assertIsInstance(HTMLBody('%s') % 'foo', HTMLBody)
+        self.assertIsInstance(HTMLBody('{}').format('foo'), HTMLBody)
+
 
 class FieldTest(unittest.TestCase):
     def test_value_validation(self):
@@ -502,17 +582,19 @@ class FieldTest(unittest.TestCase):
         field = TextField('foo', field_uri='bar', is_required=True, default='XXX')
         self.assertEqual(field.clean(None), 'XXX')
 
-        field = TextListField('foo', field_uri='bar')
+        field = CharListField('foo', field_uri='bar')
         with self.assertRaises(ValueError):
             field.clean('XXX')  # Must be a list type
 
-        field = TextListField('foo', field_uri='bar')
+        field = CharListField('foo', field_uri='bar')
         with self.assertRaises(TypeError):
             field.clean([1, 2, 3])  # List items must be correct type
 
-        field = TextField('foo', field_uri='bar')
+        field = CharField('foo', field_uri='bar')
         with self.assertRaises(TypeError):
             field.clean(1)  # Value must be correct type
+        with self.assertRaises(ValueError):
+            field.clean('X' * 256)  # Value length must be within max_length
 
         field = DateTimeField('foo', field_uri='bar')
         with self.assertRaises(ValueError):
@@ -528,6 +610,69 @@ class FieldTest(unittest.TestCase):
             field.clean(None)  # Value is required
         self.assertEqual(field.clean('XXX'), 'XXX')  # We can clean a simple value and keep it as a simple value
         self.assertEqual(field.clean(ExternId('XXX')), ExternId('XXX'))  # We can clean an ExternId instance as well
+
+        # Test min/max on IntegerField
+        field = IntegerField('foo', field_uri='bar', min=5, max=10)
+        with self.assertRaises(ValueError):
+            field.clean(2)
+        with self.assertRaises(ValueError):
+            field.clean(12)
+
+        # Test enum validation
+        field = EnumField('foo', field_uri='bar', enum=['a', 'b', 'c'])
+        with self.assertRaises(ValueError):
+            field.clean(0)  # Enums start at 1
+        with self.assertRaises(ValueError):
+            field.clean(4)  # Spills over list
+        with self.assertRaises(ValueError):
+            field.clean('d')  # Value not in enum
+
+        # Test enum list validation
+        field = EnumListField('foo', field_uri='bar', enum=['a', 'b', 'c'])
+        with self.assertRaises(ValueError):
+            field.clean([])
+        with self.assertRaises(ValueError):
+            field.clean([0])
+        with self.assertRaises(ValueError):
+            field.clean([1, 1])  # Values must be unique
+        with self.assertRaises(ValueError):
+            field.clean(['d'])
+
+        # Test ExtraWeekdaysField. Normal weedays are passed as lists, extra options as strings
+        field = ExtraWeekdaysField('foo', field_uri='bar')
+        for val in (DAY, WEEK_DAY, WEEKEND_DAY, (MONDAY, WEDNESDAY), 3, 10, (5, 7)):
+            field.clean(val)
+        for val in ('foo', ('foo', 'bar'), (3, 3), 0, 11, (1, 11)):
+            with self.assertRaises(ValueError):
+                field.clean(val)
+
+    def test_garbage_input(self):
+        # Test that we can survive garbage input for common field types
+        tz = EWSTimeZone.timezone('Europe/Copenhagen')
+        account = namedtuple('Account', ['default_timezone'])(default_timezone=tz)
+        payload = '''\
+<?xml version="1.0" encoding="utf-8"?>
+<Envelope xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+    <t:Item>
+        <t:Foo>THIS_IS_GARBAGE</t:Foo>
+    </t:Item>
+</Envelope>'''
+        elem = to_xml(payload).find('{%s}Item' % TNS)
+        for field_cls in (Base64Field, BooleanField, IntegerField, DateField, DateTimeField, DecimalField):
+            field = field_cls('foo', field_uri='item:Foo', is_required=True, default='DUMMY')
+            self.assertEqual(field.from_xml(elem=elem, account=account), None)
+
+        # Test MS timezones
+        payload = '''\
+<?xml version="1.0" encoding="utf-8"?>
+<Envelope xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+    <t:Item>
+        <t:Foo Id="THIS_IS_GARBAGE"></t:Foo>
+    </t:Item>
+</Envelope>'''
+        elem = to_xml(payload).find('{%s}Item' % TNS)
+        field = TimeZoneField('foo', field_uri='item:Foo', default='DUMMY')
+        self.assertEqual(field.from_xml(elem=elem, account=account), None)
 
     def test_versioned_field(self):
         field = TextField('foo', field_uri='bar', supported_from=EXCHANGE_2010)
@@ -631,9 +776,46 @@ class ItemTest(unittest.TestCase):
         self.assertEqual(task.percent_complete, Decimal(0))
 
 
+class RecurrenceTest(unittest.TestCase):
+    def test_magic(self):
+        pattern = AbsoluteYearlyPattern(month=FEBRUARY, day_of_month=28)
+        self.assertEqual(str(pattern), 'Occurs on day 28 of February')
+        pattern = RelativeYearlyPattern(month=AUGUST, week_number=SECOND, weekdays=[MONDAY, WEDNESDAY])
+        self.assertEqual(str(pattern), 'Occurs on weekdays Monday, Wednesday in the Second week of August')
+        pattern = AbsoluteMonthlyPattern(interval=3, day_of_month=31)
+        self.assertEqual(str(pattern), 'Occurs on day 31 of every 3 month(s)')
+        pattern = RelativeMonthlyPattern(interval=2, week_number=LAST, weekdays=[5, 7])
+        self.assertEqual(str(pattern), 'Occurs on weekdays Friday, Sunday in the Last week of every 2 month(s)')
+        pattern = WeeklyPattern(interval=4, weekdays=WEEKEND_DAY, first_day_of_week=7)
+        self.assertEqual(str(pattern),
+                         'Occurs on weekdays WeekendDay of every 4 week(s) where the first day of the week is Sunday')
+        pattern = DailyPattern(interval=6)
+        self.assertEqual(str(pattern), 'Occurs every 6 day(s)')
+
+    def test_validation(self):
+        p = DailyPattern(interval=3)
+        d_start = EWSDate(2017, 9, 1)
+        d_end = EWSDate(2017, 9, 7)
+        with self.assertRaises(ValueError):
+            Recurrence(pattern=p, boundary='foo', start='bar')  # Specify *either* boundary *or* start, end and number
+        with self.assertRaises(ValueError):
+            Recurrence(pattern=p, start='foo', end='bar', number='baz')  # number is invalid when end is present
+        with self.assertRaises(ValueError):
+            Recurrence(pattern=p, end='bar', number='baz')  # Must have start
+        r = Recurrence(pattern=p, start=d_start)
+        self.assertEqual(r.boundary, NoEndPattern(start=d_start))
+        r = Recurrence(pattern=p, start=d_start, end=d_end)
+        self.assertEqual(r.boundary, EndDatePattern(start=d_start, end=d_end))
+        r = Recurrence(pattern=p, start=d_start, number=1)
+        self.assertEqual(r.boundary, NumberedPattern(start=d_start, number=1))
+
+
 class RestrictionTest(unittest.TestCase):
     def setUp(self):
         self.maxDiff = None
+
+    def test_magic(self):
+        self.assertEqual(str(Q()), 'Q()')
 
     def test_q(self):
         tz = EWSTimeZone.timezone('Europe/Copenhagen')
@@ -667,13 +849,13 @@ class RestrictionTest(unittest.TestCase):
     </t:And>
 </m:Restriction>'''
         q = Q(Q(categories__contains='FOO') | Q(categories__contains='BAR'), start__lt=end, end__gt=start)
-        r = Restriction(q, folder=Calendar())
+        r = Restriction(q, folders=[Calendar()])
         self.assertEqual(str(r), ''.join(l.lstrip() for l in result.split('\n')))
         # Test empty Q
         q = Q()
-        self.assertEqual(q.to_xml(folder=Calendar(), version=None), None)
+        self.assertEqual(q.to_xml(folders=[Calendar()], version=None), None)
         with self.assertRaises(ValueError):
-            Restriction(q, folder=Calendar())
+            Restriction(q, folders=[Calendar()])
         # Test validation
         with self.assertRaises(ValueError):
             Q(datetime_created__range=(1,))  # Must have exactly 2 args
@@ -719,6 +901,31 @@ class RestrictionTest(unittest.TestCase):
         self.assertEqual((~Q(foo__contains=('bar', 'baz'))).conn_type, Q.NOT)
         self.assertEqual((~~Q(foo__contains=('bar', 'baz'))).conn_type, Q.AND)
         self.assertEqual(Q(foo__contains=('bar', 'baz')), ~~Q(foo__contains=('bar', 'baz')))
+        # Test generated XML of 'Not' statement when there is only one child. Skip 't:And' between 't:Not' and 't:Or'.
+        result = '''\
+<m:Restriction>
+    <t:Not>
+        <t:Or>
+            <t:IsEqualTo>
+                <t:FieldURI FieldURI="item:Subject" />
+                <t:FieldURIOrConstant>
+                    <t:Constant Value="bar" />
+                </t:FieldURIOrConstant>
+            </t:IsEqualTo>
+            <t:IsEqualTo>
+                <t:FieldURI FieldURI="item:Subject" />
+                <t:FieldURIOrConstant>
+                    <t:Constant Value="baz" />
+                </t:FieldURIOrConstant>
+            </t:IsEqualTo>
+        </t:Or>
+    </t:Not>
+</m:Restriction>'''
+        q = ~(Q(subject='bar') | Q(subject='baz'))
+        self.assertEqual(
+            xml_to_str(q.to_xml(folders=[Calendar()], version=None)),
+            ''.join(l.lstrip() for l in result.split('\n'))
+        )
 
     def test_q_boolean_ops(self):
         self.assertEqual((Q(foo=5) & Q(foo=6)).conn_type, Q.AND)
@@ -731,6 +938,14 @@ class RestrictionTest(unittest.TestCase):
 
 
 class QuerySetTest(unittest.TestCase):
+    def test_magic(self):
+        self.assertEqual(
+            str(QuerySet(
+                folder_collection=FolderCollection(account=None, folders=[Inbox(account='XXX', name='FooBox')]))
+            ),
+            'QuerySet(q=Q(), folders=[Inbox (FooBox)])'
+        )
+
     def test_from_folder(self):
         folder = Inbox(account='XXX')
         self.assertIsInstance(folder.all(), QuerySet)
@@ -739,7 +954,7 @@ class QuerySetTest(unittest.TestCase):
         self.assertIsInstance(folder.exclude(subject='foo'), QuerySet)
 
     def test_queryset_copy(self):
-        qs = QuerySet(folder=Inbox(account='XXX'))
+        qs = QuerySet(folder_collection=FolderCollection(account=None, folders=[Inbox(account='XXX')]))
         qs.q = Q()
         qs.only_fields = ('a', 'b')
         qs.order_fields = ('c', 'd')
@@ -748,7 +963,7 @@ class QuerySetTest(unittest.TestCase):
         # Initially, immutable items have the same id()
         new_qs = qs.copy()
         self.assertNotEqual(id(qs), id(new_qs))
-        self.assertEqual(id(qs.folder), id(new_qs.folder))
+        self.assertEqual(id(qs.folder_collection), id(new_qs.folder_collection))
         self.assertEqual(id(qs._cache), id(new_qs._cache))
         self.assertEqual(qs._cache, new_qs._cache)
         self.assertNotEqual(id(qs.q), id(new_qs.q))
@@ -767,16 +982,13 @@ class QuerySetTest(unittest.TestCase):
         new_qs.return_format = QuerySet.NONE
 
         self.assertNotEqual(id(qs), id(new_qs))
-        self.assertEqual(id(qs.folder), id(new_qs.folder))
+        self.assertEqual(id(qs.folder_collection), id(new_qs.folder_collection))
         self.assertEqual(id(qs._cache), id(new_qs._cache))
         self.assertEqual(qs._cache, new_qs._cache)
         self.assertNotEqual(id(qs.q), id(new_qs.q))
         self.assertEqual(qs.q, new_qs.q)
-        self.assertNotEqual(id(qs.only_fields), id(new_qs.only_fields))
         self.assertEqual(qs.only_fields, new_qs.only_fields)
-        self.assertNotEqual(id(qs.order_fields), id(new_qs.order_fields))
         self.assertEqual(qs.order_fields, new_qs.order_fields)
-        self.assertEqual(id(qs.return_format), id(new_qs.return_format))  # String literals are also singletons
         self.assertEqual(qs.return_format, new_qs.return_format)
 
         # Set the new values, forcing a new id()
@@ -786,7 +998,7 @@ class QuerySetTest(unittest.TestCase):
         new_qs.return_format = QuerySet.VALUES
 
         self.assertNotEqual(id(qs), id(new_qs))
-        self.assertEqual(id(qs.folder), id(new_qs.folder))
+        self.assertEqual(id(qs.folder_collection), id(new_qs.folder_collection))
         self.assertEqual(id(qs._cache), id(new_qs._cache))
         self.assertEqual(qs._cache, new_qs._cache)
         self.assertNotEqual(id(qs.q), id(new_qs.q))
@@ -988,9 +1200,38 @@ class UtilTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             get_domain('blah')
 
+    def test_pretty_xml_handler(self):
+        # Test that a normal, non-XML log record is passed through unchanged
+        stream = io.BytesIO() if PY2 else io.StringIO()
+        stream.isatty = lambda: True
+        h = PrettyXmlHandler(stream=stream)
+        self.assertTrue(h.is_tty())
+        r = logging.LogRecord(
+            name='baz', level=logging.INFO, pathname='/foo/bar', lineno=1, msg='hello', args=(), exc_info=None
+        )
+        h.emit(r)
+        h.stream.seek(0)
+        self.assertEqual(h.stream.read(), 'hello\n')
+
+        # Test formatting of an XML record. It should contain newlines and color codes.
+        stream = io.BytesIO() if PY2 else io.StringIO()
+        stream.isatty = lambda: True
+        h = PrettyXmlHandler(stream=stream)
+        r = logging.LogRecord(
+            name='baz', level=logging.DEBUG, pathname='/foo/bar', lineno=1, msg='hello %(xml_foo)s',
+            args=({'xml_foo': b'<?xml version="1.0" encoding="UTF-8"?><foo>bar</foo>'},), exc_info=None)
+        h.emit(r)
+        h.stream.seek(0)
+        self.assertEqual(
+            h.stream.read(),
+            "hello \x1b[36m<?xml version='1.0' encoding='utf-8'?>\x1b[39;49;00m\n\x1b[34;01m"
+            "<foo\x1b[39;49;00m\x1b[34;01m>\x1b[39;49;00mbar\x1b[34;01m</foo>\x1b[39;49;00m\n\n"
+        )
+
 
 class EWSTest(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         # There's no official Exchange server we can test against, and we can't really provide credentials for our
         # own test server to everyone on the Internet. Travis-CI uses the encrypted settings.yml.enc for testing.
         #
@@ -998,23 +1239,41 @@ class EWSTest(unittest.TestCase):
         # that server. 'settings.yml.sample' is provided as a template.
         try:
             with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'settings.yml')) as f:
-                settings = load(f)
+                settings = safe_load(f)
         except FileNotFoundError:
-            print('Skipping %s - no settings.yml file found' % self.__class__.__name__)
+            print('Skipping %s - no settings.yml file found' % cls.__name__)
             print('Copy settings.yml.sample to settings.yml and enter values for your test server')
-            raise unittest.SkipTest('Skipping %s - no settings.yml file found' % self.__class__.__name__)
-        self.tz = EWSTimeZone.timezone('Europe/Copenhagen')
+            raise unittest.SkipTest('Skipping %s - no settings.yml file found' % cls.__name__)
+
+        cls.verify_ssl = settings.get('verify_ssl', True)
+        if not cls.verify_ssl:
+            # Allow unverified SSL if requested in settings file
+            BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
+
+        # Speed up tests a bit. We don't need to wait 10 seconds for every nonexisting server in the discover dance
+        AutodiscoverProtocol.TIMEOUT = 2
+
+        # Create an account shared by all tests
+        tz = EWSTimeZone.timezone('Europe/Copenhagen')
+        config = Configuration(
+            server=settings['server'],
+            credentials=Credentials(settings['username'], settings['password'])
+        )
+        cls.account = Account(primary_smtp_address=settings['account'], access_type=DELEGATE, config=config,
+                              locale='da_DK', default_timezone=tz)
+
+    def setUp(self):
+        # Create a random category for each test to avoid crosstalk
         self.categories = [get_random_string(length=10, spaces=False, special=False)]
-        self.config = Configuration(server=settings['server'],
-                                    credentials=Credentials(settings['username'], settings['password']),
-                                    verify_ssl=settings['verify_ssl'])
-        self.account = Account(primary_smtp_address=settings['account'], access_type=DELEGATE, config=self.config,
-                               locale='da_DK', default_timezone=self.tz)
         self.maxDiff = None
+
+    def wipe_test_account(self):
+        # Deletes up all deleteable items in the test account. Not run in a normal test run
+        self.account.root.wipe()
 
     def bulk_delete(self, ids):
         # Clean up items and check return values
-        for res in self.account.bulk_delete(ids, affected_task_occurrences=ALL_OCCURRENCIES):
+        for res in self.account.bulk_delete(ids):
             self.assertEqual(res, True)
 
     def random_val(self, field):
@@ -1033,31 +1292,37 @@ class EWSTest(unittest.TestCase):
                 # In the test_extended_distinguished_property test, EWS rull return 4 NULL bytes after char 16 if we
                 # send a longer bytes sequence.
                 return get_random_string(16).encode()
-            assert False, (field.name, field, field.value_cls.python_type())
+            raise ValueError('Unsupported field %s' % field)
         if isinstance(field, URIField):
             return get_random_url()
-        if isinstance(field, EmailField):
+        if isinstance(field, EmailAddressField):
             return get_random_email()
         if isinstance(field, ChoiceField):
             return get_random_choice(field.supported_choices(version=self.account.version))
+        if isinstance(field, CultureField):
+            return get_random_choice(['da-DK', 'de-DE', 'en-US', 'es-ES', 'fr-CA', 'nl-NL', 'ru-RU', 'sv-SE'])
         if isinstance(field, BodyField):
-            return get_random_string(255)
-        if isinstance(field, TextListField):
+            return get_random_string(400)
+        if isinstance(field, CharListField):
             return [get_random_string(16) for _ in range(random.randint(1, 4))]
+        if isinstance(field, TextListField):
+            return [get_random_string(400) for _ in range(random.randint(1, 4))]
+        if isinstance(field, CharField):
+            return get_random_string(field.max_length)
         if isinstance(field, TextField):
-            return get_random_string(field.max_length or 255)
+            return get_random_string(400)
         if isinstance(field, Base64Field):
-            return get_random_string(255)
+            return get_random_bytes(400)
         if isinstance(field, BooleanField):
             return get_random_bool()
-        if isinstance(field, IntegerField):
-            return get_random_int(field.min or 0, field.max or 256)
         if isinstance(field, DecimalField):
             return get_random_decimal(field.min or 1, field.max or 99)
+        if isinstance(field, IntegerField):
+            return get_random_int(field.min or 0, field.max or 256)
         if isinstance(field, DateTimeField):
-            return get_random_datetime(tz=self.tz)
+            return get_random_datetime(tz=self.account.default_timezone)
         if isinstance(field, AttachmentField):
-            return [FileAttachment(name='my_file.txt', content=b'test_content')]
+            return [FileAttachment(name='my_file.txt', content=get_random_bytes(400))]
         if isinstance(field, MailboxListField):
             # email_address must be a real account on the server(?)
             # TODO: Mailbox has multiple optional args but vals must match server account, so we can't easily test
@@ -1081,23 +1346,25 @@ class EWSTest(unittest.TestCase):
             with_last_response_time = get_random_bool()
             if with_last_response_time:
                 return [
-                    Attendee(mailbox=mbx, response_type='Accept', last_response_time=get_random_datetime(tz=self.tz))
+                    Attendee(mailbox=mbx, response_type='Accept',
+                             last_response_time=get_random_datetime(tz=self.account.default_timezone))
                 ]
             else:
                 if get_random_bool():
                     return [Attendee(mailbox=mbx, response_type='Accept')]
                 else:
                     return [self.account.primary_smtp_address]
-        if isinstance(field, EmailAddressField):
+        if isinstance(field, EmailAddressesField):
             addrs = []
-            for label in EmailAddress.LABEL_FIELD.supported_choices(version=self.account.version):
+            for label in EmailAddress.get_field_by_fieldname('label').supported_choices(version=self.account.version):
                 addr = EmailAddress(email=get_random_email())
                 addr.label = label
                 addrs.append(addr)
             return addrs
         if isinstance(field, PhysicalAddressField):
             addrs = []
-            for label in PhysicalAddress.LABEL_FIELD.supported_choices(version=self.account.version):
+            for label in PhysicalAddress.get_field_by_fieldname('label')\
+                    .supported_choices(version=self.account.version):
                 addr = PhysicalAddress(street=get_random_string(32), city=get_random_string(32),
                                        state=get_random_string(32), country=get_random_string(32),
                                        zipcode=get_random_string(8))
@@ -1106,7 +1373,7 @@ class EWSTest(unittest.TestCase):
             return addrs
         if isinstance(field, PhoneNumberField):
             pns = []
-            for label in PhoneNumber.LABEL_FIELD.supported_choices(version=self.account.version):
+            for label in PhoneNumber.get_field_by_fieldname('label').supported_choices(version=self.account.version):
                 pn = PhoneNumber(phone_number=get_random_string(16))
                 pn.label = label
                 pns.append(pn)
@@ -1114,13 +1381,18 @@ class EWSTest(unittest.TestCase):
         if isinstance(field, EWSElementField):
             if field.value_cls == Recurrence:
                 return Recurrence(pattern=DailyPattern(interval=5), start=get_random_date(), number=7)
-        assert False, 'Unknown field %s' % field
+        if isinstance(field, TimeZoneField):
+            while True:
+                try:
+                    return EWSTimeZone.timezone(random.choice(pytz.all_timezones))
+                except UnknownTimeZone:
+                    pass
+        raise ValueError('Unknown field %s' % field)
 
 
 class CommonTest(EWSTest):
     @staticmethod
     def pprint(xml_str):
-        from lxml.etree import parse, tostring
         return tostring(parse(
             io.BytesIO(xml_str)),
             xml_declaration=True,
@@ -1181,26 +1453,63 @@ class CommonTest(EWSTest):
 ''')
 
     def test_poolsize(self):
-        self.assertEqual(self.config.protocol.SESSION_POOLSIZE, 4)
+        self.assertEqual(self.account.protocol.SESSION_POOLSIZE, 4)
+
+    def test_error_server_busy(self):
+        # Test that we can parse an ErrorServerBusy response
+        ws = GetRoomLists(self.account.protocol)
+        xml = '''\
+<?xml version='1.0' encoding='utf-8'?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <s:Fault>
+      <faultcode xmlns:a="http://schemas.microsoft.com/exchange/services/2006/types">a:ErrorServerBusy</faultcode>
+      <faultstring xml:lang="en-US">The server cannot service this request right now. Try again later.</faultstring>
+      <detail>
+        <e:ResponseCode xmlns:e="http://schemas.microsoft.com/exchange/services/2006/errors">ErrorServerBusy</e:ResponseCode>
+        <e:Message xmlns:e="http://schemas.microsoft.com/exchange/services/2006/errors">The server cannot service this request right now. Try again later.</e:Message>
+        <t:MessageXml xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+          <t:Value Name="BackOffMilliseconds">297749</t:Value>
+        </t:MessageXml>
+      </detail>
+    </s:Fault>
+  </s:Body>
+</s:Envelope>'''
+        with self.assertRaises(ErrorServerBusy) as cm:
+            ws._get_elements_in_response(response=ws._get_soap_payload(soap_response=to_xml(xml)))
+        self.assertEqual(cm.exception.back_off, 297.749)
 
     def test_get_timezones(self):
-        ws = GetServerTimeZones(self.config.protocol)
+        ws = GetServerTimeZones(self.account.protocol)
         data = ws.call()
         self.assertAlmostEqual(len(list(data)), 130, delta=30, msg=data)
         # Test shortcut
-        self.assertAlmostEqual(len(list(self.config.protocol.get_timezones())), 130, delta=30, msg=data)
+        self.assertAlmostEqual(len(list(self.account.protocol.get_timezones())), 130, delta=30, msg=data)
+        # Test translation to TimeZone objects
+        for tz_id, tz_name, periods, transitions, transitionsgroups in self.account.protocol.get_timezones(
+                return_full_timezone_data=True):
+            TimeZone.from_server_timezone(periods=periods, transitions=transitions, transitionsgroups=transitionsgroups,
+                                          for_year=2018)
+
+    def test_get_free_busy_info(self):
+        tz = EWSTimeZone.timezone('Europe/Copenhagen')
+        start = tz.localize(EWSDateTime.now())
+        end = tz.localize(EWSDateTime.now() + datetime.timedelta(hours=6))
+        accounts = [(self.account, 'Organizer', False)]
+        for view_info in self.account.protocol.get_free_busy_info(accounts=accounts, start=start, end=end):
+            self.assertIsInstance(view_info, FreeBusyView)
 
     def test_get_roomlists(self):
         # The test server is not guaranteed to have any room lists which makes this test less useful
-        ws = GetRoomLists(self.config.protocol)
+        ws = GetRoomLists(self.account.protocol)
         roomlists = ws.call()
         self.assertEqual(roomlists, [])
         # Test shortcut
-        self.assertEqual(self.config.protocol.get_roomlists(), [])
+        self.assertEqual(self.account.protocol.get_roomlists(), [])
 
     def test_get_roomlists_parsing(self):
         # Test static XML since server has no roomlists
-        ws = GetRoomLists(self.config.protocol)
+        ws = GetRoomLists(self.account.protocol)
         xml = '''\
 <?xml version="1.0" ?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -1244,16 +1553,16 @@ class CommonTest(EWSTest):
     def test_get_rooms(self):
         # The test server is not guaranteed to have any rooms or room lists which makes this test less useful
         roomlist = RoomList(email_address='my.roomlist@example.com')
-        ws = GetRooms(self.config.protocol)
+        ws = GetRooms(self.account.protocol)
         with self.assertRaises(ErrorNameResolutionNoResults):
             ws.call(roomlist=roomlist)
         # Test shortcut
         with self.assertRaises(ErrorNameResolutionNoResults):
-            self.config.protocol.get_rooms('my.roomlist@example.com')
+            self.account.protocol.get_rooms('my.roomlist@example.com')
 
     def test_get_rooms_parsing(self):
         # Test static XML since server has no rooms
-        ws = GetRooms(self.config.protocol)
+        ws = GetRooms(self.account.protocol)
         xml = '''\
 <?xml version="1.0" ?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -1267,9 +1576,7 @@ class CommonTest(EWSTest):
     <s:Body>
         <m:GetRoomsResponse ResponseClass="Success"
                 xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
-                xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
-                xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+                xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
             <m:ResponseCode>NoError</m:ResponseCode>
             <m:Rooms>
                 <t:Room>
@@ -1298,10 +1605,142 @@ class CommonTest(EWSTest):
             {'room1@example.com', 'room2@example.com'}
         )
 
+    def test_resolvenames(self):
+        self.assertGreaterEqual(
+            self.account.protocol.resolve_names(names=['xxx@example.com']),
+            []
+        )
+        self.assertEqual(
+            self.account.protocol.resolve_names(names=[self.account.primary_smtp_address]),
+            [Mailbox(email_address=self.account.primary_smtp_address)]
+        )
+        # Test something that's not an email
+        self.assertEqual(
+            self.account.protocol.resolve_names(names=['foo\\bar']),
+            []
+        )
+
+    def test_resolvenames_parsing(self):
+        # Test static XML since server has no roomlists
+        ws = ResolveNames(self.account.protocol)
+        xml = '''\
+<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Header>
+    <h:ServerVersionInfo
+        MajorVersion="15" MinorVersion="0" MajorBuildNumber="1293" MinorBuildNumber="4" Version="V2_23"
+        xmlns:h="http://schemas.microsoft.com/exchange/services/2006/types"
+        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"/>
+  </s:Header>
+  <s:Body>
+    <m:ResolveNamesResponse
+            xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+            xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:ResolveNamesResponseMessage ResponseClass="Warning">
+          <m:MessageText>Multiple results were found.</m:MessageText>
+          <m:ResponseCode>ErrorNameResolutionMultipleResults</m:ResponseCode>
+          <m:DescriptiveLinkKey>0</m:DescriptiveLinkKey>
+          <m:ResolutionSet TotalItemsInView="2" IncludesLastItemInRange="true">
+            <t:Resolution>
+              <t:Mailbox>
+                <t:Name>John Doe</t:Name>
+                <t:EmailAddress>anne@example.com</t:EmailAddress>
+                <t:RoutingType>SMTP</t:RoutingType>
+                <t:MailboxType>Mailbox</t:MailboxType>
+              </t:Mailbox>
+            </t:Resolution>
+            <t:Resolution>
+              <t:Mailbox>
+                <t:Name>John Deer</t:Name>
+                <t:EmailAddress>john@example.com</t:EmailAddress>
+                <t:RoutingType>SMTP</t:RoutingType>
+                <t:MailboxType>Mailbox</t:MailboxType>
+              </t:Mailbox>
+            </t:Resolution>
+          </m:ResolutionSet>
+        </m:ResolveNamesResponseMessage>
+      </m:ResponseMessages>
+    </m:ResolveNamesResponse>
+  </s:Body>
+</s:Envelope>'''
+        res = ws._get_elements_in_response(response=ws._get_soap_payload(soap_response=to_xml(xml)))
+        self.assertSetEqual(
+            {Mailbox.from_xml(elem=elem.find(Mailbox.response_tag()), account=None).email_address for elem in res},
+            {'anne@example.com', 'john@example.com'}
+        )
+
+    def test_oof_settings(self):
+        oof = OofSettings(
+            state=OofSettings.ENABLED,
+            external_audience='None',
+            internal_reply="I'm on holidays. See ya guys!",
+            external_reply='Dear Sir, your email has now been deleted.',
+        )
+        self.account.oof_settings = oof
+        self.assertEqual(self.account.oof_settings, oof)
+
+        oof = OofSettings(
+            state=OofSettings.ENABLED,
+            external_audience='Known',
+            internal_reply='XXX',
+            external_reply='YYY',
+        )
+        self.account.oof_settings = oof
+        self.assertEqual(self.account.oof_settings, oof)
+
+        # Scheduled duration must not be in the past
+        start, end = get_random_datetime_range(start_date=EWSDate.today())
+        oof = OofSettings(
+            state=OofSettings.SCHEDULED,
+            external_audience='Known',
+            internal_reply="I'm in the pub. See ya guys!",
+            external_reply="I'm having a business dinner in town",
+            start=start,
+            end=end,
+        )
+        self.account.oof_settings = oof
+        self.assertEqual(self.account.oof_settings, oof)
+
+        oof = OofSettings(
+            state=OofSettings.DISABLED,
+        )
+        self.account.oof_settings = oof
+        self.assertEqual(self.account.oof_settings, oof)
+
+    def test_oof_settings_validation(self):
+        with self.assertRaises(ValueError):
+            # Needs a start and end
+            OofSettings(
+                state=OofSettings.SCHEDULED,
+            ).clean(version=None)
+        with self.assertRaises(ValueError):
+            # Start must be before end
+            OofSettings(
+                state=OofSettings.SCHEDULED,
+                start=UTC.localize(EWSDateTime(2100, 12, 1)),
+                end=UTC.localize(EWSDateTime(2100, 11, 1)),
+            ).clean(version=None)
+        with self.assertRaises(ValueError):
+            # End must be in the future
+            OofSettings(
+                state=OofSettings.SCHEDULED,
+                start=UTC.localize(EWSDateTime(2000, 11, 1)),
+                end=UTC.localize(EWSDateTime(2000, 12, 1)),
+            ).clean(version=None)
+        with self.assertRaises(ValueError):
+            # Must have an internal and external reply
+            OofSettings(
+                state=OofSettings.SCHEDULED,
+                start=UTC.localize(EWSDateTime(2100, 11, 1)),
+                end=UTC.localize(EWSDateTime(2100, 12, 1)),
+            ).clean(version=None)
+
     def test_sessionpool(self):
         # First, empty the calendar
-        start = self.tz.localize(EWSDateTime(2011, 10, 12, 8))
-        end = self.tz.localize(EWSDateTime(2011, 10, 12, 10))
+        start = self.account.default_timezone.localize(EWSDateTime(2011, 10, 12, 8))
+        end = self.account.default_timezone.localize(EWSDateTime(2011, 10, 12, 10))
         self.account.calendar.filter(start__lt=end, end__gt=start, categories__contains=self.categories).delete()
         items = []
         for i in range(75):
@@ -1322,29 +1761,70 @@ class CommonTest(EWSTest):
         self.bulk_delete(return_items)
 
     def test_magic(self):
-        self.assertIn(self.config.protocol.version.api_version, str(self.config.protocol))
-        self.assertIn(self.config.credentials.username, str(self.config.credentials))
+        self.assertIn(self.account.protocol.version.api_version, str(self.account.protocol))
+        self.assertIn(self.account.protocol.credentials.username, str(self.account.protocol.credentials))
         self.assertIn(self.account.primary_smtp_address, str(self.account))
         self.assertIn(str(self.account.version.build.major_version), repr(self.account.version))
         for item in (
-                self.config,
-                self.config.protocol,
+                self.account.protocol,
                 self.account.version,
-                self.account.trash,
-                self.account.drafts,
-                self.account.inbox,
-                self.account.outbox,
-                self.account.sent,
-                self.account.junk,
-                self.account.contacts,
-                self.account.tasks,
-                self.account.calendar,
-                self.account.recoverable_items_root,
-                self.account.recoverable_deleted_items,
         ):
             # Just test that these at least don't throw errors
             repr(item)
             str(item)
+        for attr in (
+                'admin_audit_logs',
+                'archive_deleted_items',
+                'archive_inbox',
+                'archive_msg_folder_root',
+                'archive_recoverable_items_deletions',
+                'archive_recoverable_items_purges',
+                'archive_recoverable_items_root',
+                'archive_recoverable_items_versions',
+                'archive_root',
+                'calendar',
+                'conflicts',
+                'contacts',
+                'conversation_history',
+                'directory',
+                'drafts',
+                'favorites',
+                'im_contact_list',
+                'inbox',
+                'journal',
+                'junk',
+                'local_failures',
+                'msg_folder_root',
+                'my_contacts',
+                'notes',
+                'outbox',
+                'people_connect',
+                'public_folders_root',
+                'quick_contacts',
+                'recipient_cache',
+                'recoverable_items_deletions',
+                'recoverable_items_purges',
+                'recoverable_items_root',
+                'recoverable_items_versions',
+                'search_folders',
+                'sent',
+                'server_failures',
+                'sync_issues',
+                'tasks',
+                'todo_search',
+                'trash',
+                'voice_mail',
+        ):
+            # Test distinguished folder shortcuts. Some may raise ErrorAccessDenied
+            try:
+                item = getattr(self.account, attr)
+            except (ErrorAccessDenied, ErrorFolderNotFound, ErrorItemNotFound, ErrorInvalidOperation,
+                    ErrorNoPublicFolderReplicaAvailable):
+                continue
+            else:
+                repr(item)
+                str(item)
+                self.assertTrue(item.is_distinguished)
 
     def test_configuration(self):
         with self.assertRaises(AttributeError):
@@ -1357,21 +1837,20 @@ class CommonTest(EWSTest):
     def test_failed_login(self):
         with self.assertRaises(UnauthorizedError):
             Configuration(
-                service_endpoint=self.config.protocol.service_endpoint,
-                credentials=Credentials(self.config.protocol.credentials.username, 'WRONG_PASSWORD'),
-                verify_ssl=self.config.protocol.verify_ssl)
+                service_endpoint=self.account.protocol.service_endpoint,
+                credentials=Credentials(self.account.protocol.credentials.username, 'WRONG_PASSWORD'))
         with self.assertRaises(AutoDiscoverFailed):
             Account(
                 primary_smtp_address=self.account.primary_smtp_address,
                 access_type=DELEGATE,
-                credentials=Credentials(self.config.protocol.credentials.username, 'WRONG_PASSWORD'),
+                credentials=Credentials(self.account.protocol.credentials.username, 'WRONG_PASSWORD'),
                 autodiscover=True,
                 locale='da_DK')
 
     def test_post_ratelimited(self):
         url = 'https://example.com'
 
-        protocol = self.config.protocol
+        protocol = self.account.protocol
         credentials = protocol.credentials
         # Make sure we fail fast in error cases
         protocol.credentials = Credentials(username=credentials.username, password=credentials.password)
@@ -1380,55 +1859,55 @@ class CommonTest(EWSTest):
 
         # Test the straight, HTTP 200 path
         session.post = mock_post(url, 200, {}, 'foo')
-        r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+        r, session = post_ratelimited(protocol=protocol, session=session, url='http://', headers=None, data='')
         self.assertEqual(r.text, 'foo')
 
         # Test exceptions raises by the POST request
         for err_cls in CONNECTION_ERRORS:
             session.post = mock_session_exception(err_cls)
             with self.assertRaises(err_cls):
-                r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+                r, session = post_ratelimited(protocol=protocol, session=session, url='http://', headers=None, data='')
 
         # Test bad exit codes and headers
-        session.post = mock_post(url, 401, {}, '')
+        session.post = mock_post(url, 401, {})
         with self.assertRaises(UnauthorizedError):
-            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
-        session.post = mock_post(url, 999, {'connection': 'close'}, '')
+            r, session = post_ratelimited(protocol=protocol, session=session, url='http://', headers=None, data='')
+        session.post = mock_post(url, 999, {'connection': 'close'})
         with self.assertRaises(TransportError):
-            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
-        session.post = mock_post(url, 302, {'location': '/ews/genericerrorpage.htm?aspxerrorpath=/ews/exchange.asmx'}, '')
+            r, session = post_ratelimited(protocol=protocol, session=session, url='http://', headers=None, data='')
+        session.post = mock_post(url, 302, {'location': '/ews/genericerrorpage.htm?aspxerrorpath=/ews/exchange.asmx'})
         with self.assertRaises(TransportError):
-            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
-        session.post = mock_post(url, 503, {}, '')
+            r, session = post_ratelimited(protocol=protocol, session=session, url='http://', headers=None, data='')
+        session.post = mock_post(url, 503, {})
         with self.assertRaises(TransportError):
-            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+            r, session = post_ratelimited(protocol=protocol, session=session, url='http://', headers=None, data='')
 
         # No redirect header
-        session.post = mock_post(url, 302, {}, '')
+        session.post = mock_post(url, 302, {})
         with self.assertRaises(TransportError):
             r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
         # Redirect header to same location
-        session.post = mock_post(url, 302, {'location': url}, '')
+        session.post = mock_post(url, 302, {'location': url})
         with self.assertRaises(TransportError):
             r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
         # Redirect header to relative location
-        session.post = mock_post(url, 302, {'location': url + '/foo'}, '')
+        session.post = mock_post(url, 302, {'location': url + '/foo'})
         with self.assertRaises(RedirectError):
             r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
         # Redirect header to other location and allow_redirects=False
-        session.post = mock_post(url, 302, {'location': 'https://contoso.com'}, '')
+        session.post = mock_post(url, 302, {'location': 'https://contoso.com'})
         with self.assertRaises(TransportError):
             r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
         # Redirect header to other location and allow_redirects=True
         import exchangelib.util
         exchangelib.util.MAX_REDIRECTS = 0
-        session.post = mock_post(url, 302, {'location': 'https://contoso.com'}, '')
+        session.post = mock_post(url, 302, {'location': 'https://contoso.com'})
         with self.assertRaises(TransportError):
             r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='',
                                           allow_redirects=True)
 
         # CAS error
-        session.post = mock_post(url, 999, {'X-CasErrorCode': 'AAARGH!'}, '')
+        session.post = mock_post(url, 999, {'X-CasErrorCode': 'AAARGH!'})
         with self.assertRaises(CASError):
             r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
 
@@ -1438,21 +1917,21 @@ class CommonTest(EWSTest):
         self.assertEqual(r.text, '<?xml version="1.0" ?><foo></foo>')
 
         # Bad status_code and bad text
-        session.post = mock_post(url, 999, {}, '')
+        session.post = mock_post(url, 999, {})
         with self.assertRaises(TransportError):
             r, session = post_ratelimited(protocol=protocol, session=session, url=url, headers=None, data='')
 
         # Rate limit exceeded
         protocol.credentials = ServiceAccount(username=credentials.username, password=credentials.password, max_wait=1)
-        session.post = mock_post(url, 503, {'connection': 'close'}, '')
+        session.post = mock_post(url, 503, {'connection': 'close'})
         protocol.renew_session = lambda s: s  # Return the same session so it's still mocked
         with self.assertRaises(RateLimitError):
-            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+            r, session = post_ratelimited(protocol=protocol, session=session, url='http://', headers=None, data='')
         # Test something larger than the default wait, so we retry at least once
         protocol.credentials.max_wait = 15
-        session.post = mock_post(url, 503, {'connection': 'close'}, '')
+        session.post = mock_post(url, 503, {'connection': 'close'})
         with self.assertRaises(RateLimitError):
-            r, session = post_ratelimited(protocol=protocol, session=session, url='', headers=None, data='')
+            r, session = post_ratelimited(protocol=protocol, session=session, url='http://', headers=None, data='')
 
         protocol.release_session(session)
         protocol.credentials = credentials
@@ -1563,7 +2042,7 @@ class CommonTest(EWSTest):
 
     @requests_mock.mock()
     def test_invalid_soap_response(self, m):
-        m.post(self.config.protocol.service_endpoint, text='XXX')
+        m.post(self.account.protocol.service_endpoint, text='XXX')
         with self.assertRaises(SOAPError):
             self.account.inbox.all().count()
 
@@ -1606,13 +2085,11 @@ class AccountTest(EWSTest):
             Account(primary_smtp_address='blah@example.com', autodiscover=False)
 
     def test_get_default_folder(self):
-        class MockCalendar(Calendar):
-            pass
         # Test a normal folder lookup with GetFolder
-        folder = self.account._get_default_folder(MockCalendar)
-        self.assertIsInstance(folder, MockCalendar)
+        folder = self.account.root.get_default_folder(Calendar)
+        self.assertIsInstance(folder, Calendar)
         self.assertNotEqual(folder.folder_id, None)
-        self.assertEqual(folder.name, MockCalendar.LOCALIZED_NAMES[self.account.locale][0])
+        self.assertEqual(folder.name.lower(), Calendar.localized_names(self.account.locale)[0])
 
         class MockCalendar(Calendar):
             @classmethod
@@ -1620,7 +2097,7 @@ class AccountTest(EWSTest):
                 raise ErrorAccessDenied('foo')
 
         # Test an indirect folder lookup with FindItems
-        folder = self.account._get_default_folder(MockCalendar)
+        folder = self.account.root.get_default_folder(MockCalendar)
         self.assertIsInstance(folder, MockCalendar)
         self.assertEqual(folder.folder_id, None)
         self.assertEqual(folder.name, MockCalendar.DISTINGUISHED_FOLDER_ID)
@@ -1633,22 +2110,24 @@ class AccountTest(EWSTest):
         # Test using the one folder of this folder type
         with self.assertRaises(ErrorFolderNotFound):
             # This fails because there are no folders of type MockCalendar
-            self.account._get_default_folder(MockCalendar)
+            self.account.root.get_default_folder(MockCalendar)
 
         _orig = Calendar.get_distinguished
-        Calendar.get_distinguished = MockCalendar.get_distinguished
-        folder = self.account._get_default_folder(Calendar)
-        self.assertIsInstance(folder, Calendar)
-        self.assertNotEqual(folder.folder_id, None)
-        self.assertEqual(folder.name, MockCalendar.LOCALIZED_NAMES[self.account.locale][0])
-        Calendar.get_distinguished = _orig
+        try:
+            Calendar.get_distinguished = MockCalendar.get_distinguished
+            folder = self.account.root.get_default_folder(Calendar)
+            self.assertIsInstance(folder, Calendar)
+            self.assertNotEqual(folder.folder_id, None)
+            self.assertEqual(folder.name.lower(), MockCalendar.localized_names(self.account.locale)[0])
+        finally:
+            Calendar.get_distinguished = _orig
 
 
 class AutodiscoverTest(EWSTest):
     def test_magic(self):
-        from exchangelib.autodiscover import _autodiscover_cache
         # Just test we don't fail
-        discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+        from exchangelib.autodiscover import _autodiscover_cache
+        discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         str(_autodiscover_cache)
         repr(_autodiscover_cache)
         for protocol in _autodiscover_cache._protocols.values():
@@ -1657,66 +2136,63 @@ class AutodiscoverTest(EWSTest):
 
     def test_autodiscover(self):
         primary_smtp_address, protocol = discover(email=self.account.primary_smtp_address,
-                                                  credentials=self.config.credentials)
+                                                  credentials=self.account.protocol.credentials)
         self.assertEqual(primary_smtp_address, self.account.primary_smtp_address)
-        self.assertEqual(protocol.service_endpoint.lower(), self.config.protocol.service_endpoint.lower())
-        self.assertEqual(protocol.version.build, self.config.protocol.version.build)
+        self.assertEqual(protocol.service_endpoint.lower(), self.account.protocol.service_endpoint.lower())
+        self.assertEqual(protocol.version.build, self.account.protocol.version.build)
 
     def test_autodiscover_failure(self):
-        from exchangelib.autodiscover import _autodiscover_cache
         # Empty the cache
+        from exchangelib.autodiscover import _autodiscover_cache
         _autodiscover_cache.clear()
         with self.assertRaises(ErrorNonExistentMailbox):
             # Test that error is raised with an empty cache
-            discover(email='XXX.' + self.account.primary_smtp_address, credentials=self.config.credentials)
+            discover(email='XXX.' + self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         with self.assertRaises(ErrorNonExistentMailbox):
             # Test that error is raised with a full cache
-            discover(email='XXX.' + self.account.primary_smtp_address, credentials=self.config.credentials)
+            discover(email='XXX.' + self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
 
     def test_close_autodiscover_connections(self):
-        discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+        discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         close_connections()
 
     def test_autodiscover_gc(self):
-        from exchangelib.autodiscover import _autodiscover_cache
         # This is what Python garbage collection does
-        discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+        from exchangelib.autodiscover import _autodiscover_cache
+        discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         del _autodiscover_cache
 
     def test_autodiscover_direct_gc(self):
-        from exchangelib.autodiscover import _autodiscover_cache
         # This is what Python garbage collection does
-        discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+        from exchangelib.autodiscover import _autodiscover_cache
+        discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         _autodiscover_cache.__del__()
 
     @requests_mock.mock(real_http=True)
     def test_autodiscover_cache(self, m):
-        from exchangelib.autodiscover import _autodiscover_cache
-        import exchangelib.autodiscover
-
         # Empty the cache
+        from exchangelib.autodiscover import _autodiscover_cache
         _autodiscover_cache.clear()
-        cache_key = (self.account.domain, self.config.credentials, self.config.protocol.verify_ssl)
+        cache_key = (self.account.domain, self.account.protocol.credentials)
         # Not cached
         self.assertNotIn(cache_key, _autodiscover_cache)
-        discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+        discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         # Now it's cached
         self.assertIn(cache_key, _autodiscover_cache)
         # Make sure the cache can be looked by value, not by id(). This is important for multi-threading/processing
         self.assertIn((
             self.account.primary_smtp_address.split('@')[1],
-            Credentials(self.config.credentials.username, self.config.credentials.password),
+            Credentials(self.account.protocol.credentials.username, self.account.protocol.credentials.password),
             True
         ), _autodiscover_cache)
         # Poison the cache. discover() must survive and rebuild the cache
         _autodiscover_cache[cache_key] = AutodiscoverProtocol(
             service_endpoint='https://example.com/blackhole.asmx',
             credentials=Credentials('leet_user', 'cannaguess'),
-            auth_type=NTLM,
-            verify_ssl=True
+            auth_type=NTLM
         )
         m.post('https://example.com/blackhole.asmx', status_code=404)
-        discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+        discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         self.assertIn(cache_key, _autodiscover_cache)
 
         # Make sure that the cache is actually used on the second call to discover()
@@ -1725,11 +2201,11 @@ class AutodiscoverTest(EWSTest):
         def _mock(*args, **kwargs):
             raise NotImplementedError()
         exchangelib.autodiscover._try_autodiscover = _mock
-        discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+        discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         # Fake that another thread added the cache entry into the persistent storage but we don't have it in our
         # in-memory cache. The cache should work anyway.
         _autodiscover_cache._protocols.clear()
-        discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+        discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         exchangelib.autodiscover._try_autodiscover = _orig
         # Make sure we can delete cache entries even though we don't have it in our in-memory cache
         _autodiscover_cache._protocols.clear()
@@ -1738,8 +2214,8 @@ class AutodiscoverTest(EWSTest):
         del _autodiscover_cache[cache_key]
 
     def test_corrupt_autodiscover_cache(self):
-        from exchangelib.autodiscover import _autodiscover_cache
         # Insert a fake Protocol instance into the cache
+        from exchangelib.autodiscover import _autodiscover_cache
         key = (2, 'foo', 4)
         _autodiscover_cache[key] = namedtuple('P', ['service_endpoint', 'auth_type'])(1, 'bar')
         # Check that it exists. 'in' goes directly to the file
@@ -1754,35 +2230,36 @@ class AutodiscoverTest(EWSTest):
     def test_autodiscover_from_account(self):
         from exchangelib.autodiscover import _autodiscover_cache
         _autodiscover_cache.clear()
-        account = Account(primary_smtp_address=self.account.primary_smtp_address, credentials=self.config.credentials,
+        account = Account(primary_smtp_address=self.account.primary_smtp_address,
+                          credentials=self.account.protocol.credentials,
                           autodiscover=True, locale='da_DK')
         self.assertEqual(account.primary_smtp_address, self.account.primary_smtp_address)
-        self.assertEqual(account.protocol.service_endpoint.lower(), self.config.protocol.service_endpoint.lower())
-        self.assertEqual(account.protocol.version.build, self.config.protocol.version.build)
+        self.assertEqual(account.protocol.service_endpoint.lower(), self.account.protocol.service_endpoint.lower())
+        self.assertEqual(account.protocol.version.build, self.account.protocol.version.build)
         # Make sure cache is full
-        self.assertTrue((account.domain, self.config.credentials, True) in _autodiscover_cache)
+        self.assertTrue((account.domain, self.account.protocol.credentials, True) in _autodiscover_cache)
         # Test that autodiscover works with a full cache
-        account = Account(primary_smtp_address=self.account.primary_smtp_address, credentials=self.config.credentials,
+        account = Account(primary_smtp_address=self.account.primary_smtp_address,
+                          credentials=self.account.protocol.credentials,
                           autodiscover=True, locale='da_DK')
         self.assertEqual(account.primary_smtp_address, self.account.primary_smtp_address)
         # Test cache manipulation
-        key = (account.domain, self.config.credentials, True)
+        key = (account.domain, self.account.protocol.credentials, True)
         self.assertTrue(key in _autodiscover_cache)
         del _autodiscover_cache[key]
         self.assertFalse(key in _autodiscover_cache)
         del _autodiscover_cache
 
     def test_autodiscover_redirect(self):
-        import exchangelib.autodiscover
         # Prime the cache
-        email, p = discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+        email, p = discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         _orig = exchangelib.autodiscover._autodiscover_quick
 
         # Test that we can get another address back than the address we're looking up
         def _mock1(credentials, email, protocol):
             return 'john@example.com', p
         exchangelib.autodiscover._autodiscover_quick = _mock1
-        test_email, p = discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+        test_email, p = discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         self.assertEqual(test_email, 'john@example.com')
 
         # Test that we can survive being asked to lookup with another address
@@ -1792,35 +2269,35 @@ class AutodiscoverTest(EWSTest):
             raise AutoDiscoverRedirect(redirect_email='xxxxxx@'+self.account.domain)
         exchangelib.autodiscover._autodiscover_quick = _mock2
         with self.assertRaises(ErrorNonExistentMailbox):
-            discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+            discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
 
         # Test that we catch circular redirects
         def _mock3(credentials, email, protocol):
             raise AutoDiscoverRedirect(redirect_email=self.account.primary_smtp_address)
         exchangelib.autodiscover._autodiscover_quick = _mock3
         with self.assertRaises(AutoDiscoverCircularRedirect):
-            discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+            discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         exchangelib.autodiscover._autodiscover_quick = _orig
 
         # Test that we catch circular redirects when cache is empty. This is a different code path
         _orig = exchangelib.autodiscover._try_autodiscover
-        def _mock4(hostname, credentials, email, verify):
+        def _mock4(hostname, credentials, email):
             raise AutoDiscoverRedirect(redirect_email=self.account.primary_smtp_address)
         exchangelib.autodiscover._try_autodiscover = _mock4
         exchangelib.autodiscover._autodiscover_cache.clear()
         with self.assertRaises(AutoDiscoverCircularRedirect):
-            discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+            discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         exchangelib.autodiscover._try_autodiscover = _orig
 
         # Test that we can survive being asked to lookup with another address, when cache is empty
-        def _mock5(hostname, credentials, email, verify):
+        def _mock5(hostname, credentials, email):
             if email == 'xxxxxx@%s' % self.account.domain:
                 raise ErrorNonExistentMailbox(email)
             raise AutoDiscoverRedirect(redirect_email='xxxxxx@'+self.account.domain)
         exchangelib.autodiscover._try_autodiscover = _mock5
         exchangelib.autodiscover._autodiscover_cache.clear()
         with self.assertRaises(ErrorNonExistentMailbox):
-            discover(email=self.account.primary_smtp_address, credentials=self.config.credentials)
+            discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
         exchangelib.autodiscover._try_autodiscover = _orig
 
     def test_canonical_lookup(self):
@@ -1838,7 +2315,6 @@ class AutodiscoverTest(EWSTest):
             # No SRV record
             _get_hostname_from_srv('example.com.')
         # Finding a real server that has a correct SRV record is not easy. Mock it
-        import dns.resolver
         _orig = dns.resolver.Resolver
 
         class _Mock1:
@@ -1867,7 +2343,6 @@ class AutodiscoverTest(EWSTest):
 
     def test_parse_response(self):
         from exchangelib.autodiscover import _parse_response
-
         with self.assertRaises(AutoDiscoverFailed):
             _parse_response('XXX')  # Invalid response
 
@@ -1958,13 +2433,80 @@ class AutodiscoverTest(EWSTest):
         with self.assertRaises(AutoDiscoverFailed):
             _parse_response(xml)
 
+    def test_disable_ssl_verification(self):
+        if not self.verify_ssl:
+            # We can only run this test if we haven't already disabled SSL
+            raise self.skipTest('SSL verification already disabled')
+        import exchangelib.autodiscover
+
+        default_adapter_cls = BaseProtocol.HTTP_ADAPTER_CLS
+
+        # A normal discover should succeed
+        exchangelib.autodiscover._autodiscover_cache.clear()
+        discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
+
+        # Smash SSL verification using an untrusted certificate
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(b'''\
+ -----BEGIN CERTIFICATE-----
+MIIENzCCAx+gAwIBAgIJAOYfYfw7NCOcMA0GCSqGSIb3DQEBBQUAMIGxMQswCQYD
+VQQGEwJVUzERMA8GA1UECAwITWFyeWxhbmQxFDASBgNVBAcMC0ZvcmVzdCBIaWxs
+MScwJQYDVQQKDB5UaGUgQXBhY2hlIFNvZnR3YXJlIEZvdW5kYXRpb24xFjAUBgNV
+BAsMDUFwYWNoZSBUaHJpZnQxEjAQBgNVBAMMCWxvY2FsaG9zdDEkMCIGCSqGSIb3
+DQEJARYVZGV2QHRocmlmdC5hcGFjaGUub3JnMB4XDTE0MDQwNzE4NTgwMFoXDTIy
+MDYyNDE4NTgwMFowgbExCzAJBgNVBAYTAlVTMREwDwYDVQQIDAhNYXJ5bGFuZDEU
+MBIGA1UEBwwLRm9yZXN0IEhpbGwxJzAlBgNVBAoMHlRoZSBBcGFjaGUgU29mdHdh
+cmUgRm91bmRhdGlvbjEWMBQGA1UECwwNQXBhY2hlIFRocmlmdDESMBAGA1UEAwwJ
+bG9jYWxob3N0MSQwIgYJKoZIhvcNAQkBFhVkZXZAdGhyaWZ0LmFwYWNoZS5vcmcw
+ggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCqE9TE9wEXp5LRtLQVDSGQ
+GV78+7ZtP/I/ZaJ6Q6ZGlfxDFvZjFF73seNhAvlKlYm/jflIHYLnNOCySN8I2Xw6
+L9MbC+jvwkEKfQo4eDoxZnOZjNF5J1/lZtBeOowMkhhzBMH1Rds351/HjKNg6ZKg
+2Cldd0j7HbDtEixOLgLbPRpBcaYrLrNMasf3Hal+x8/b8ue28x93HSQBGmZmMIUw
+AinEu/fNP4lLGl/0kZb76TnyRpYSPYojtS6CnkH+QLYnsRREXJYwD1Xku62LipkX
+wCkRTnZ5nUsDMX6FPKgjQFQCWDXG/N096+PRUQAChhrXsJ+gF3NqWtDmtrhVQF4n
+AgMBAAGjUDBOMB0GA1UdDgQWBBQo8v0wzQPx3EEexJPGlxPK1PpgKjAfBgNVHSME
+GDAWgBQo8v0wzQPx3EEexJPGlxPK1PpgKjAMBgNVHRMEBTADAQH/MA0GCSqGSIb3
+DQEBBQUAA4IBAQBGFRiJslcX0aJkwZpzTwSUdgcfKbpvNEbCNtVohfQVTI4a/oN5
+U+yqDZJg3vOaOuiAZqyHcIlZ8qyesCgRN314Tl4/JQ++CW8mKj1meTgo5YFxcZYm
+T9vsI3C+Nzn84DINgI9mx6yktIt3QOKZRDpzyPkUzxsyJ8J427DaimDrjTR+fTwD
+1Dh09xeeMnSa5zeV1HEDyJTqCXutLetwQ/IyfmMBhIx+nvB5f67pz/m+Dv6V0r3I
+p4HCcdnDUDGJbfqtoqsAATQQWO+WWuswB6mOhDbvPTxhRpZq6AkgWqv4S+u3M2GO
+r5p9FrBgavAw5bKO54C0oQKpN/5fta5l6Ws0
+-----END CERTIFICATE-----''')
+            try:
+                os.environ['REQUESTS_CA_BUNDLE'] = f.name
+
+                # Now discover should fail. SSL errors mean we exhaust all autodiscover attempts
+                with self.assertRaises(AutoDiscoverFailed):
+                    exchangelib.autodiscover._autodiscover_cache.clear()
+                    discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
+
+                # Disable insecure SSL warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    # Make sure we can survive SSL validation errors when using the custom adapter
+                    exchangelib.autodiscover._autodiscover_cache.clear()
+                    BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
+                    discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
+
+                    # Test that the custom adapter also works when validation is OK again
+                    del os.environ['REQUESTS_CA_BUNDLE']
+                    exchangelib.autodiscover._autodiscover_cache.clear()
+                    discover(email=self.account.primary_smtp_address, credentials=self.account.protocol.credentials)
+            finally:
+                # Reset environment
+                os.environ.pop('REQUESTS_CA_BUNDLE', None)  # May already have been deleted
+                exchangelib.autodiscover._autodiscover_cache.clear()
+                BaseProtocol.HTTP_ADAPTER_CLS = default_adapter_cls
+
 
 class FolderTest(EWSTest):
     def test_folders(self):
-        folders = self.account.folders
-        for folder_cls, cls_folders in folders.items():
-            for f in cls_folders:
-                f.test_access()
+        for f in self.account.root.walk():
+            if isinstance(f, System):
+                # No access to system folder, apparently
+                continue
+            f.test_access()
         # Test shortcuts
         for f, cls in (
                 (self.account.trash, DeletedItems),
@@ -1984,37 +2526,48 @@ class FolderTest(EWSTest):
             with self.assertRaises(ValueError):
                 f.get_item_field_by_fieldname('XXX')
 
-    def test_getfolders(self):
-        folders = list(self.account.root.get_folders())
-        self.assertGreater(len(folders), 60, sorted(f.name for f in folders))
-        with self.assertRaises(ValueError):
-            self.account.inbox.get_folder_by_name(get_random_string(16))
+    def test_find_folders(self):
+        folders = list(FolderCollection(account=self.account, folders=[self.account.root]).find_folders())
+        self.assertGreater(len(folders), 40, sorted(f.name for f in folders))
 
     def test_folder_grouping(self):
-        folders = self.account.folders
         # If you get errors here, you probably need to fill out [folder class].LOCALIZED_NAMES for your locale.
-        self.assertEqual(len(folders[Inbox]), 1)
-        self.assertEqual(len(folders[SentItems]), 1)
-        self.assertEqual(len(folders[Outbox]), 1)
-        self.assertEqual(len(folders[DeletedItems]), 1)
-        self.assertEqual(len(folders[JunkEmail]), 1)
-        self.assertEqual(len(folders[Drafts]), 1)
-        self.assertGreaterEqual(len(folders[Contacts]), 1)
-        self.assertGreaterEqual(len(folders[Calendar]), 1)
-        self.assertGreaterEqual(len(folders[Tasks]), 1)
-        for f in folders[Messages]:
-            self.assertEqual(f.folder_class, 'IPF.Note')
-        for f in folders[Contacts]:
-            self.assertEqual(f.folder_class, 'IPF.Contact')
-        for f in folders[Calendar]:
-            self.assertEqual(f.folder_class, 'IPF.Appointment')
-        for f in folders[Tasks]:
-            self.assertEqual(f.folder_class, 'IPF.Task')
-
-    def test_get_folder_by_name(self):
-        folder_name = Calendar.LOCALIZED_NAMES[self.account.locale][0]
-        f = self.account.root.get_folder_by_name(folder_name)
-        self.assertEqual(f.name, folder_name)
+        for f in self.account.root.walk():
+            if isinstance(f, (
+                    Messages, DeletedItems, AllContacts, MyContactsExtended, Sharing, Favorites, SyncIssues, MyContacts
+            )):
+                self.assertEqual(f.folder_class, 'IPF.Note')
+            elif isinstance(f, GALContacts):
+                self.assertEqual(f.folder_class, 'IPF.Contact.GalContacts')
+            elif isinstance(f, RecipientCache):
+                self.assertEqual(f.folder_class, 'IPF.Contact.RecipientCache')
+            elif isinstance(f, Contacts):
+                self.assertEqual(f.folder_class, 'IPF.Contact')
+            elif isinstance(f, Calendar):
+                self.assertEqual(f.folder_class, 'IPF.Appointment')
+            elif isinstance(f, (Tasks, ToDoSearch)):
+                self.assertEqual(f.folder_class, 'IPF.Task')
+            elif isinstance(f, Reminders):
+                self.assertEqual(f.folder_class, 'Outlook.Reminder')
+            elif isinstance(f, AllItems):
+                self.assertEqual(f.folder_class, 'IPF')
+            elif isinstance(f, ConversationSettings):
+                self.assertEqual(f.folder_class, 'IPF.Configuration')
+            elif isinstance(f, Friends):
+                self.assertEqual(f.folder_class, 'IPF.Note')
+            elif isinstance(f, RSSFeeds):
+                self.assertEqual(f.folder_class, 'IPF.Note.OutlookHomepage')
+            elif isinstance(f, IMContactList):
+                self.assertEqual(f.folder_class, 'IPF.Contact.MOC.ImContactList')
+            elif isinstance(f, QuickContacts):
+                self.assertEqual(f.folder_class, 'IPF.Contact.MOC.QuickContacts')
+            elif isinstance(f, Journal):
+                self.assertEqual(f.folder_class, 'IPF.Journal')
+            elif isinstance(f, Notes):
+                self.assertEqual(f.folder_class, 'IPF.StickyNote')
+            else:
+                self.assertEqual(f.folder_class, None, (f.name, f.__class__.__name__, f.folder_class))
+                self.assertIsInstance(f, Folder)
 
     def test_counts(self):
         # Test count values on a folder
@@ -2049,21 +2602,37 @@ class FolderTest(EWSTest):
 
     def test_refresh(self):
         # Test that we can refresh folders
-        folders = self.account.folders
-        for folder_cls, cls_folders in folders.items():
-            for f in cls_folders:
-                old_values = {}
-                for field in folder_cls.FIELDS:
-                    old_values[field.name] = getattr(f, field.name)
-                    if field.name in ('account', 'folder_id', 'changekey'):
-                        # These are needed for a successful refresh()
+        for f in self.account.root.walk():
+            if isinstance(f, System):
+                # Can't refresh the 'System' folder for some reason
                         continue
-                    if field.is_read_only:
-                        continue
-                    setattr(f, field.name, self.random_val(field))
-                f.refresh()
-                for field in folder_cls.FIELDS:
-                    self.assertEqual(getattr(f, field.name), old_values[field.name])
+            old_values = {}
+            for field in f.FIELDS:
+                old_values[field.name] = getattr(f, field.name)
+                if field.name in ('account', 'folder_id', 'changekey', 'parent_folder_id'):
+                    # These are needed for a successful refresh()
+                    continue
+                if field.is_read_only:
+                    continue
+                setattr(f, field.name, self.random_val(field))
+            f.refresh()
+            for field in f.FIELDS:
+                if field.name == 'changekey':
+                    # folders may change while we're testing
+                    continue
+                if field.is_read_only:
+                    # count values may change during the test
+                    continue
+                self.assertEqual(getattr(f, field.name), old_values[field.name], field.name)
+
+        # Test refresh of root
+        all_folders = sorted(f.name for f in self.account.root.walk())
+        self.account.root.refresh()
+        self.assertIsNone(self.account.root._subfolders)
+        self.assertEqual(
+            sorted(f.name for f in self.account.root.walk()),
+            all_folders
+        )
 
         folder = Folder()
         with self.assertRaises(ValueError):
@@ -2071,6 +2640,123 @@ class FolderTest(EWSTest):
         folder.account = 'XXX'
         with self.assertRaises(ValueError):
             folder.refresh()  # Must have an item_id
+
+    def test_parent(self):
+        self.assertEqual(
+            self.account.calendar.parent.name,
+            'Top of Information Store'
+        )
+        self.assertEqual(
+            self.account.calendar.parent.parent.name,
+            'root'
+        )
+
+    def test_children(self):
+        self.assertIn(
+            'Top of Information Store',
+            [c.name for c in self.account.root.children]
+        )
+
+    def test_parts(self):
+        self.assertEqual(
+            [p.name for p in self.account.calendar.parts],
+            ['root', 'Top of Information Store', self.account.calendar.name]
+        )
+
+    def test_absolute(self):
+        self.assertEqual(
+            self.account.calendar.absolute,
+            '/root/Top of Information Store/' + self.account.calendar.name
+        )
+
+    def test_walk(self):
+        self.assertGreaterEqual(len(list(self.account.root.walk())), 20)
+        self.assertGreaterEqual(len(list(self.account.contacts.walk())), 2)
+
+    def test_tree(self):
+        self.assertTrue(self.account.root.tree().startswith('root'))
+
+    def test_glob(self):
+        self.assertGreaterEqual(len(list(self.account.root.glob('*'))), 5)
+        self.assertEqual(len(list(self.account.contacts.glob('GAL*'))), 1)
+        self.assertGreaterEqual(len(list(self.account.contacts.glob('/'))), 5)
+        self.assertGreaterEqual(len(list(self.account.contacts.glob('../*'))), 5)
+        self.assertEqual(len(list(self.account.root.glob('**/%s' % self.account.contacts.name))), 1)
+        self.assertEqual(len(list(self.account.root.glob('Top of*/%s' % self.account.contacts.name))), 1)
+
+    def test_collection_filtering(self):
+        self.assertGreaterEqual(self.account.root.tois.children.all().exists(), 0)
+        self.assertGreaterEqual(self.account.root.tois.walk().all().exists(), 0)
+        self.assertGreaterEqual(self.account.root.tois.glob('*').all().exists(), 0)
+
+    def test_div_navigation(self):
+        self.assertEqual(
+            self.account.root / 'Top of Information Store' / self.account.calendar.name,
+            self.account.calendar
+        )
+        self.assertEqual(
+            self.account.root / 'Top of Information Store' / '..',
+            self.account.root
+        )
+        self.assertEqual(
+            self.account.root / '.',
+            self.account.root
+        )
+
+    def test_extended_properties(self):
+        # Extended properties also work with folders. Here's an example of getting the size (in bytes) of a folder:
+        class FolderSize(ExtendedProperty):
+            property_tag = 0x0e08
+            property_type = 'Integer'
+
+        try:
+            Folder.register('size', FolderSize)
+            self.account.inbox.refresh()
+            self.assertGreater(self.account.inbox.size, 0)
+        finally:
+            Folder.deregister('size')
+
+    def test_create_update_empty_delete(self):
+        f = Messages(parent=self.account.inbox, name=get_random_string(16))
+        f.save()
+        self.assertIsNotNone(f.folder_id)
+        self.assertIsNotNone(f.changekey)
+
+        new_name = get_random_string(16)
+        f.name = new_name
+        f.save()
+        f.refresh()
+        self.assertEqual(f.name, new_name)
+
+        with self.assertRaises(ValueError):
+            # FolderClass may not be deleted
+            f.save(update_fields=['folder_class'])
+
+        # Create a subfolder
+        Messages(parent=f, name=get_random_string(16)).save()
+        self.assertEqual(len(list(f.children)), 1)
+        f.empty()
+        self.assertEqual(len(list(f.children)), 1)
+        f.empty(delete_sub_folders=True)
+        self.assertEqual(len(list(f.children)), 0)
+
+        # Create a subfolder again, and delete it by wiping
+        Messages(parent=f, name=get_random_string(16)).save()
+        self.assertEqual(len(list(f.children)), 1)
+        f.wipe()
+        self.assertEqual(len(list(f.children)), 0)
+
+        f.delete()
+        with self.assertRaises(ValueError):
+            # No longer has an ID
+            f.refresh()
+
+        # Delete all subfolders of inbox
+        for c in self.account.inbox.children:
+            c.delete()
+
+        with self.assertRaises(ErrorDeleteDistinguishedFolder):
+            self.account.inbox.delete()
 
 
 class BaseItemTest(EWSTest):
@@ -2103,6 +2789,9 @@ class BaseItemTest(EWSTest):
             if f.is_read_only:
                 # These cannot be created
                 continue
+            if f.name == 'mime_content':
+                # This needs special formatting. See separate test_mime_content() test
+                continue
             if f.name == 'attachments':
                 # Testing attachments is heavy. Leave this to specific tests
                 insert_kwargs[f.name] = []
@@ -2118,7 +2807,7 @@ class BaseItemTest(EWSTest):
             if f.name == 'start':
                 start = get_random_date()
                 insert_kwargs[f.name], insert_kwargs['end'] = \
-                    get_random_datetime_range(start_date=start, end_date=start, tz=self.tz)
+                    get_random_datetime_range(start_date=start, end_date=start, tz=self.account.default_timezone)
                 insert_kwargs['recurrence'] = self.random_val(self.ITEM_CLASS.get_field_by_fieldname('recurrence'))
                 insert_kwargs['recurrence'].boundary.start = insert_kwargs[f.name].date()
                 continue
@@ -2128,7 +2817,8 @@ class BaseItemTest(EWSTest):
                 continue
             if f.name == 'due_date':
                 # start_date must be before due_date
-                insert_kwargs['start_date'], insert_kwargs[f.name] = get_random_datetime_range(tz=self.tz)
+                insert_kwargs['start_date'], insert_kwargs[f.name] = \
+                    get_random_datetime_range(tz=self.account.default_timezone)
                 continue
             if f.name == 'start_date':
                 continue
@@ -2159,6 +2849,9 @@ class BaseItemTest(EWSTest):
             if not item.is_draft and f.is_read_only_after_send:
                 # These cannot be changed when the item is no longer a draft
                 continue
+            if f.name == 'message_id' and f.is_read_only_after_send:
+                # Cannot be updated, regardless of draft status
+                continue
             if f.name == 'attachments':
                 # Testing attachments is heavy. Leave this to specific tests
                 update_kwargs[f.name] = []
@@ -2173,7 +2866,7 @@ class BaseItemTest(EWSTest):
             if f.name == 'start':
                 start = get_random_date(start_date=insert_kwargs['end'].date())
                 update_kwargs[f.name], update_kwargs['end'] = \
-                    get_random_datetime_range(start_date=start, end_date=start, tz=self.tz)
+                    get_random_datetime_range(start_date=start, end_date=start, tz=self.account.default_timezone)
                 update_kwargs['recurrence'] = self.random_val(self.ITEM_CLASS.get_field_by_fieldname('recurrence'))
                 update_kwargs['recurrence'].boundary.start = update_kwargs[f.name].date()
                 continue
@@ -2184,7 +2877,7 @@ class BaseItemTest(EWSTest):
             if f.name == 'due_date':
                 # start_date must be before due_date, and before complete_date which must be in the past
                 update_kwargs['start_date'], update_kwargs[f.name] = \
-                    get_random_datetime_range(end_date=now.date(), tz=self.tz)
+                    get_random_datetime_range(end_date=now.date(), tz=self.account.default_timezone)
                 continue
             if f.name == 'start_date':
                 continue
@@ -2215,8 +2908,8 @@ class BaseItemTest(EWSTest):
         if update_kwargs.get('is_all_day', False):
             # For is_all_day items, EWS will remove the time part of start and end values
             update_kwargs['start'] = update_kwargs['start'].replace(hour=0, minute=0, second=0, microsecond=0)
-            update_kwargs['end'] = update_kwargs['end'].replace(hour=0, minute=0, second=0, microsecond=0) \
-                                   + datetime.timedelta(days=1)
+            update_kwargs['end'] = \
+                update_kwargs['end'].replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
         if self.ITEM_CLASS == CalendarItem:
             # EWS always sets due date to 'start'
             update_kwargs['reminder_due_by'] = update_kwargs['start']
@@ -2234,15 +2927,15 @@ class BaseItemTest(EWSTest):
 
     def test_magic(self):
         item = self.get_test_item()
-        self.assertIn('item_id', str(item))
+        self.assertIn('subject=', str(item))
         self.assertIn(item.__class__.__name__, repr(item))
 
     def test_validation(self):
         item = self.get_test_item()
         item.clean()
         for f in self.ITEM_CLASS.FIELDS:
-            # Test field maxlength
-            if isinstance(f, TextField) and f.max_length:
+            # Test field max_length
+            if isinstance(f, CharField) and f.max_length:
                 with self.assertRaises(ValueError):
                     setattr(item, f.name, 'a' * (f.max_length + 1))
                     item.clean()
@@ -2256,6 +2949,7 @@ class BaseItemTest(EWSTest):
         self.assertEqual(self.account.bulk_update(items=[]), [])
         self.assertEqual(self.account.bulk_delete(ids=[]), [])
         self.assertEqual(self.account.bulk_send(ids=[]), [])
+        self.assertEqual(self.account.bulk_copy(ids=[], to_folder=self.account.trash), [])
         self.assertEqual(self.account.bulk_move(ids=[], to_folder=self.account.trash), [])
         self.assertEqual(self.account.upload(data=[]), [])
         self.assertEqual(self.account.export(items=[]), [])
@@ -2269,6 +2963,7 @@ class BaseItemTest(EWSTest):
             self.assertEqual(self.account.bulk_update(items=qs), [])
         self.assertEqual(self.account.bulk_delete(ids=qs), [])
         self.assertEqual(self.account.bulk_send(ids=qs), [])
+        self.assertEqual(self.account.bulk_copy(ids=qs, to_folder=self.account.trash), [])
         self.assertEqual(self.account.bulk_move(ids=qs, to_folder=self.account.trash), [])
         with self.assertRaises(ValueError):
             self.assertEqual(self.account.upload(data=qs), [])
@@ -2282,6 +2977,7 @@ class BaseItemTest(EWSTest):
         self.assertEqual(self.account.bulk_update([]), [])
         self.assertEqual(self.account.bulk_delete([]), [])
         self.assertEqual(self.account.bulk_send([]), [])
+        self.assertEqual(self.account.bulk_copy([], to_folder=self.account.trash), [])
         self.assertEqual(self.account.bulk_move([], to_folder=self.account.trash), [])
         self.assertEqual(self.account.upload([]), [])
         self.assertEqual(self.account.export([]), [])
@@ -2346,9 +3042,24 @@ class BaseItemTest(EWSTest):
             item = self.get_test_item()
             item.save()
             item_id, changekey = item.item_id, item.changekey
-            item.delete(affected_task_occurrences=ALL_OCCURRENCIES)
+            item.delete()
             item.item_id, item.changekey = item_id, changekey
             item.refresh()  # Refresh an item that doesn't exist
+
+        with self.assertRaises(ValueError):
+            item = self.get_test_item()
+            item.account = None
+            item.copy(to_folder=self.test_folder)  # Must have an account on copy
+        with self.assertRaises(ValueError):
+            item = self.get_test_item()
+            item.copy(to_folder=self.test_folder)  # Must be an existing item
+        with self.assertRaises(ErrorItemNotFound):
+            item = self.get_test_item()
+            item.save()
+            item_id, changekey = item.item_id, item.changekey
+            item.delete()
+            item.item_id, item.changekey = item_id, changekey
+            item.copy(to_folder=self.test_folder)  # Item disappeared
 
         with self.assertRaises(ValueError):
             item = self.get_test_item()
@@ -2361,7 +3072,7 @@ class BaseItemTest(EWSTest):
             item = self.get_test_item()
             item.save()
             item_id, changekey = item.item_id, item.changekey
-            item.delete(affected_task_occurrences=ALL_OCCURRENCIES)
+            item.delete()
             item.item_id, item.changekey = item_id, changekey
             item.move(to_folder=self.test_folder)  # Item disappeared
 
@@ -2371,14 +3082,41 @@ class BaseItemTest(EWSTest):
             item.delete()  # Must have an account
         with self.assertRaises(ValueError):
             item = self.get_test_item()
-            item.delete(affected_task_occurrences=ALL_OCCURRENCIES)  # Must be an existing item
+            item.delete()  # Must be an existing item
         with self.assertRaises(ErrorItemNotFound):
             item = self.get_test_item()
             item.save()
             item_id, changekey = item.item_id, item.changekey
-            item.delete(affected_task_occurrences=ALL_OCCURRENCIES)
+            item.delete()
             item.item_id, item.changekey = item_id, changekey
-            item.delete(affected_task_occurrences=ALL_OCCURRENCIES)  # Item disappeared
+            item.delete()  # Item disappeared
+
+    def test_unsupported_fields(self):
+        # Create a field that is not supported by any current versions. Test that we fail when using this field
+        class UnsupportedProp(ExtendedProperty):
+            property_set_id = 'deadcafe-beef-beef-beef-deadcafebeef'
+            property_name = 'Unsupported Property'
+            property_type = 'String'
+
+        attr_name = 'unsupported_property'
+        self.ITEM_CLASS.register(attr_name=attr_name, attr_cls=UnsupportedProp)
+        try:
+            for f in self.ITEM_CLASS.FIELDS:
+                if f.name == attr_name:
+                    f.supported_from = Build(99, 99, 99, 99)
+
+            with self.assertRaises(ValueError):
+                self.test_folder.get(**{attr_name: 'XXX'})
+            with self.assertRaises(ValueError):
+                list(self.test_folder.filter(**{attr_name: 'XXX'}))
+            with self.assertRaises(ValueError):
+                list(self.test_folder.all().only(attr_name))
+            with self.assertRaises(ValueError):
+                list(self.test_folder.all().values(attr_name))
+            with self.assertRaises(ValueError):
+                list(self.test_folder.all().values_list(attr_name))
+        finally:
+            self.ITEM_CLASS.deregister(attr_name=attr_name)
 
     def test_querysets(self):
         test_items = []
@@ -2387,7 +3125,9 @@ class BaseItemTest(EWSTest):
             item.subject = 'Item %s' % i
             item.save()
             test_items.append(item)
-        qs = QuerySet(self.test_folder).filter(categories__contains=self.categories)
+        qs = QuerySet(
+            folder_collection=FolderCollection(account=self.account, folders=[self.test_folder])
+        ).filter(categories__contains=self.categories)
         test_cat = self.categories[0]
         self.assertEqual(
             set((i.subject, i.categories[0]) for i in qs),
@@ -2431,6 +3171,8 @@ class BaseItemTest(EWSTest):
             [i for i in qs.order_by('subject').values('subject')],
             [{'subject': 'Item 0'}, {'subject': 'Item 1'}, {'subject': 'Item 2'}, {'subject': 'Item 3'}]
         )
+
+        # Test .values() in combinations of 'item_id' and 'changekey', which are handled specially
         self.assertEqual(
             list(qs.order_by('subject').values('item_id')),
             [{'item_id': i.item_id} for i in test_items]
@@ -2443,10 +3185,13 @@ class BaseItemTest(EWSTest):
             list(qs.order_by('subject').values('item_id', 'changekey')),
             [{k: getattr(i, k) for k in ('item_id', 'changekey')} for i in test_items]
         )
+
         self.assertEqual(
             set(i for i in qs.values_list('subject')),
             {('Item 0',), ('Item 1',), ('Item 2',), ('Item 3',)}
         )
+
+        # Test .values_list() in combinations of 'item_id' and 'changekey', which are handled specially
         self.assertEqual(
             list(qs.order_by('subject').values_list('item_id')),
             [(i.item_id,) for i in test_items]
@@ -2459,6 +3204,26 @@ class BaseItemTest(EWSTest):
             list(qs.order_by('subject').values_list('item_id', 'changekey')),
             [(i.item_id, i.changekey) for i in test_items]
         )
+
+        self.assertEqual(
+            set(i.subject for i in qs.only('subject')),
+            {'Item 0', 'Item 1', 'Item 2', 'Item 3'}
+        )
+
+        # Test .only() in combinations of 'item_id' and 'changekey', which are handled specially
+        self.assertEqual(
+            list((i.item_id,) for i in qs.order_by('subject').only('item_id')),
+            [(i.item_id,) for i in test_items]
+        )
+        self.assertEqual(
+            list((i.changekey,) for i in qs.order_by('subject').only('changekey')),
+            [(i.changekey,) for i in test_items]
+        )
+        self.assertEqual(
+            list((i.item_id, i.changekey) for i in qs.order_by('subject').only('item_id', 'changekey')),
+            [(i.item_id, i.changekey) for i in test_items]
+        )
+
         with self.assertRaises(ValueError):
             list(qs.values_list('item_id', 'changekey', flat=True))
         with self.assertRaises(AttributeError):
@@ -2521,7 +3286,9 @@ class BaseItemTest(EWSTest):
             item.subject = 'Item %s' % i
             item.save()
             test_items.append(item)
-        qs = QuerySet(self.test_folder).filter(categories__contains=self.categories).order_by('subject')
+        qs = QuerySet(
+            folder_collection=FolderCollection(account=self.account, folders=[self.test_folder])
+        ).filter(categories__contains=self.categories).order_by('subject')
         for _ in qs:
             # Build up the cache
             pass
@@ -2539,12 +3306,24 @@ class BaseItemTest(EWSTest):
         with self.assertRaises(ValueError):
             list(self.test_folder.filter(item_id__in=[item.item_id]))
         with self.assertRaises(ValueError):
-            list(self.test_folder.get(item_id=item.item_id))
-        with self.assertRaises(ValueError):
             list(self.test_folder.get(item_id=item.item_id, changekey=item.changekey, subject='XXX'))
+        with self.assertRaises(ValueError):
+            list(self.test_folder.get(item_id=None, changekey=item.changekey))
 
         # Test a simple get()
         get_item = self.test_folder.get(item_id=item.item_id, changekey=item.changekey)
+        self.assertEqual(item.item_id, get_item.item_id)
+        self.assertEqual(item.changekey, get_item.changekey)
+        self.assertEqual(item.subject, get_item.subject)
+        self.assertEqual(item.body, get_item.body)
+
+        # Test get() with ID only
+        get_item = self.test_folder.get(item_id=item.item_id)
+        self.assertEqual(item.item_id, get_item.item_id)
+        self.assertEqual(item.changekey, get_item.changekey)
+        self.assertEqual(item.subject, get_item.subject)
+        self.assertEqual(item.body, get_item.body)
+        get_item = self.test_folder.get(item_id=item.item_id, changekey=None)
         self.assertEqual(item.item_id, get_item.item_id)
         self.assertEqual(item.changekey, get_item.changekey)
         self.assertEqual(item.subject, get_item.subject)
@@ -2566,12 +3345,37 @@ class BaseItemTest(EWSTest):
 
     def test_queryset_nonsearchable_fields(self):
         for f in self.ITEM_CLASS.FIELDS:
-            if not f.is_searchable:
+            if f.is_searchable or isinstance(f, IdField) or not f.supports_version(self.account.version):
+                continue
+            if f.name in ('percent_complete', 'allow_new_time_proposal'):
+                # These fields don't raise an error when used in a filter, but also don't match anything in a filter
+                continue
+            try:
+                filter_val = f.clean(self.random_val(f))
+                filter_kwargs = {'%s__in' % f.name: filter_val} if f.is_list else {f.name: filter_val}
+
+                # We raise ValueError when searching on an is_searchable=False field
                 with self.assertRaises(ValueError):
-                    list(self.test_folder.filter(**{f.name: 'XXX'}))
+                    list(self.test_folder.filter(**filter_kwargs))
+
+                # Make sure the is_searchable=False setting is correct by searching anyway and testing that this
+                # fails server-side. This only works for values that we are actually able to convert to a search
+                # string.
+                try:
+                    value_to_xml_text(filter_val)
+                except NotImplementedError:
+                    continue
+
+                f.is_searchable = True
+                with self.assertRaises((ErrorUnsupportedPathForQuery, ErrorInvalidValueForProperty)):
+                    list(self.test_folder.filter(**filter_kwargs))
+            finally:
+                f.is_searchable = False
 
     def test_queryset_failure(self):
-        qs = QuerySet(self.test_folder).filter(categories__contains=self.categories)
+        qs = QuerySet(
+            folder_collection=FolderCollection(account=self.account, folders=[self.test_folder])
+        ).filter(categories__contains=self.categories)
         with self.assertRaises(ValueError):
             qs.order_by('XXX')
         with self.assertRaises(ValueError):
@@ -2586,7 +3390,9 @@ class BaseItemTest(EWSTest):
     def test_order_by_failure(self):
         # Test error handling on indexed properties with labels and subfields
         if self.ITEM_CLASS == Contact:
-            qs = QuerySet(self.test_folder).filter(categories__contains=self.categories)
+            qs = QuerySet(
+                folder_collection=FolderCollection(account=self.account, folders=[self.test_folder])
+            ).filter(categories__contains=self.categories)
             with self.assertRaises(ValueError):
                 qs.order_by('email_addresses')  # Must have label
             with self.assertRaises(ValueError):
@@ -2606,7 +3412,9 @@ class BaseItemTest(EWSTest):
             item.subject = 'Subj %s' % i
             test_items.append(item)
         self.test_folder.bulk_create(items=test_items)
-        qs = QuerySet(self.test_folder).filter(categories__contains=self.categories)
+        qs = QuerySet(
+            folder_collection=FolderCollection(account=self.account, folders=[self.test_folder])
+        ).filter(categories__contains=self.categories)
         self.assertEqual(
             [i for i in qs.order_by('subject').values_list('subject', flat=True)],
             ['Subj 0', 'Subj 1', 'Subj 2', 'Subj 3']
@@ -2624,7 +3432,9 @@ class BaseItemTest(EWSTest):
             item.extern_id = 'ID %s' % i
             test_items.append(item)
         self.test_folder.bulk_create(items=test_items)
-        qs = QuerySet(self.test_folder).filter(categories__contains=self.categories)
+        qs = QuerySet(
+            folder_collection=FolderCollection(account=self.account, folders=[self.test_folder])
+        ).filter(categories__contains=self.categories)
         self.assertEqual(
             [i for i in qs.order_by('extern_id').values_list('extern_id', flat=True)],
             ['ID 0', 'ID 1', 'ID 2', 'ID 3']
@@ -2638,13 +3448,15 @@ class BaseItemTest(EWSTest):
         # Test order_by() on IndexedField (simple and multi-subfield). Only Contact items have these
         if self.ITEM_CLASS == Contact:
             test_items = []
-            label = self.random_val(EmailAddress.LABEL_FIELD)
+            label = self.random_val(EmailAddress.get_field_by_fieldname('label'))
             for i in range(4):
                 item = self.get_test_item()
                 item.email_addresses = [EmailAddress(email='%s@foo.com' % i, label=label)]
                 test_items.append(item)
             self.test_folder.bulk_create(items=test_items)
-            qs = QuerySet(self.test_folder).filter(categories__contains=self.categories)
+            qs = QuerySet(
+                folder_collection=FolderCollection(account=self.account, folders=[self.test_folder])
+            ).filter(categories__contains=self.categories)
             self.assertEqual(
                 [i[0].email for i in qs.order_by('email_addresses__%s' % label)
                     .values_list('email_addresses', flat=True)],
@@ -2658,13 +3470,15 @@ class BaseItemTest(EWSTest):
             self.bulk_delete(qs)
 
             test_items = []
-            label = self.random_val(PhysicalAddress.LABEL_FIELD)
+            label = self.random_val(PhysicalAddress.get_field_by_fieldname('label'))
             for i in range(4):
                 item = self.get_test_item()
                 item.physical_addresses = [PhysicalAddress(street='Elm St %s' % i, label=label)]
                 test_items.append(item)
             self.test_folder.bulk_create(items=test_items)
-            qs = QuerySet(self.test_folder).filter(categories__contains=self.categories)
+            qs = QuerySet(
+                folder_collection=FolderCollection(account=self.account, folders=[self.test_folder])
+            ).filter(categories__contains=self.categories)
             self.assertEqual(
                 [i[0].street for i in qs.order_by('physical_addresses__%s__street' % label)
                     .values_list('physical_addresses', flat=True)],
@@ -2686,7 +3500,9 @@ class BaseItemTest(EWSTest):
                 item.extern_id = 'ID %s' % j
                 test_items.append(item)
         self.test_folder.bulk_create(items=test_items)
-        qs = QuerySet(self.test_folder).filter(categories__contains=self.categories)
+        qs = QuerySet(
+            folder_collection=FolderCollection(account=self.account, folders=[self.test_folder])
+        ).filter(categories__contains=self.categories)
         self.assertEqual(
             [i for i in qs.order_by('subject', 'extern_id').values('subject', 'extern_id')],
             [{'subject': 'Subj 0', 'extern_id': 'ID 0'},
@@ -3049,10 +3865,10 @@ class BaseItemTest(EWSTest):
             len(self.test_folder.filter('subject:%s' % item.subject)),
             (0, 1)
         )
-        item.delete(affected_task_occurrences=ALL_OCCURRENCIES)
+        item.delete()
 
     def test_filter_on_all_fields(self):
-        # Test that we can filter on all field names that we support filtering on
+        # Test that we can filter on all field names
         # TODO: Test filtering on subfields of IndexedField
         item = self.get_test_item()
         if hasattr(item, 'is_all_day'):
@@ -3123,7 +3939,8 @@ class BaseItemTest(EWSTest):
             items.append(i)
         self.test_folder.bulk_create(items=items)
         ids = self.test_folder.filter(categories__contains=self.categories).values_list('item_id', 'changekey')
-        self.bulk_delete(ids.iterator(page_size=10))
+        ids.page_size = 10
+        self.bulk_delete(ids.iterator())
 
     def test_slicing(self):
         # Test that slicing works correctly
@@ -3209,7 +4026,7 @@ class BaseItemTest(EWSTest):
         ids = self.test_folder.filter(categories__contains=item.categories)
         items = list(self.account.fetch(ids=ids))
         for item in items:
-            assert isinstance(item, self.ITEM_CLASS)
+            self.assertIsInstance(item, self.ITEM_CLASS)
         self.assertEqual(len(items), 2)
 
         items = list(self.account.fetch(ids=ids, only_fields=['subject']))
@@ -3220,8 +4037,76 @@ class BaseItemTest(EWSTest):
 
         self.bulk_delete(ids)
 
+    def test_text_field_settings(self):
+        # Test that the max_length and is_complex field settings are correctly set for text fields
+        item = self.get_test_item().save()
+        for f in self.ITEM_CLASS.FIELDS:
+            if not f.supports_version(self.account.version):
+                # Cannot be used with this EWS version
+                continue
+            if not isinstance(f, TextField):
+                continue
+            if isinstance(f, ChoiceField):
+                # This one can't contain random values
+                continue
+            if isinstance(f, CultureField):
+                # This one can't contain random values
+                continue
+            if f.is_read_only:
+                continue
+            if f.name == 'categories':
+                # We're filtering on this one, so leave it alone
+                continue
+            old_max_length = getattr(f, 'max_length', None)
+            old_is_complex = f.is_complex
+            try:
+                # Set a string long enough to not be handled by FindItems
+                f.max_length = 4000
+                if f.is_list:
+                    setattr(item, f.name, [get_random_string(f.max_length) for _ in range(len(getattr(item, f.name)))])
+                else:
+                    setattr(item, f.name, get_random_string(f.max_length))
+                try:
+                    item.save(update_fields=[f.name])
+                except ErrorPropertyUpdate:
+                    # Some fields throw this error when updated to a huge value
+                    self.assertIn(f.name, ['given_name', 'middle_name', 'surname'])
+                    continue
+                except ErrorInvalidPropertySet:
+                    # Some fields can not be updated after save
+                    self.assertTrue(f.is_read_only_after_send)
+                    continue
+                # is_complex=True forces the query to use GetItems which will always get the full value
+                f.is_complex = True
+                new_full_item = self.test_folder.all().only(f.name).get(categories__contains=self.categories)
+                new_full = getattr(new_full_item, f.name)
+                if old_max_length:
+                    if f.is_list:
+                        for s in new_full:
+                            self.assertLessEqual(len(s), old_max_length, (f.name, len(s), old_max_length))
+                    else:
+                        self.assertLessEqual(len(new_full), old_max_length, (f.name, len(new_full), old_max_length))
+
+                # is_complex=False forces the query to use FindItems which will only get the short value
+                f.is_complex = False
+                if isinstance(f, BodyField):
+                    with self.assertRaises(ErrorInvalidPropertyForOperation):
+                        self.test_folder.all().only(f.name).get(categories__contains=self.categories)
+                    continue
+                new_short_item = self.test_folder.all().only(f.name).get(categories__contains=self.categories)
+                new_short = getattr(new_short_item, f.name)
+
+                if not old_is_complex:
+                    self.assertEqual(new_short, new_full, (f.name, new_short, new_full))
+            finally:
+                if old_max_length:
+                    f.max_length = old_max_length
+                else:
+                    delattr(f, 'max_length')
+                f.is_complex = old_is_complex
+
     def test_complex_fields(self):
-        # Test that complex fields can be fetched using only(). This is a test for #141
+        # Test that complex fields can be fetched using only(). This is a test for #141.
         insert_kwargs = self.get_random_insert_kwargs()
         if 'is_all_day' in insert_kwargs:
             insert_kwargs['is_all_day'] = False
@@ -3236,6 +4121,9 @@ class BaseItemTest(EWSTest):
                 continue
             if f.name == 'reminder_due_by':
                 # EWS sets a default value if it is not set on insert. Ignore
+                continue
+            if f.name == 'mime_content':
+                # This will change depending on other contents fields
                 continue
             old = getattr(item, f.name)
             # Test field as single element in only()
@@ -3252,12 +4140,22 @@ class BaseItemTest(EWSTest):
                 self.assertEqual(old, new, (f.name, old, new))
         self.bulk_delete([item])
 
+    def test_text_body(self):
+        if self.account.version.build < EXCHANGE_2013:
+            raise self.skipTest('Exchange version too old')
+        item = self.get_test_item()
+        item.body = 'X' * 500  # Make body longer than the normal 256 char text field limit
+        item.save()
+        fresh_item = self.test_folder.filter(categories__contains=item.categories).only('text_body')[0]
+        self.assertEqual(fresh_item.text_body, item.body)
+        item.delete()
+
     def test_only_fields(self):
         item = self.get_test_item()
         self.test_folder.bulk_create(items=[item, item])
         items = self.test_folder.filter(categories__contains=item.categories)
         for item in items:
-            assert isinstance(item, self.ITEM_CLASS)
+            self.assertIsInstance(item, self.ITEM_CLASS)
             for f in self.ITEM_CLASS.FIELDS:
                 self.assertTrue(hasattr(item, f.name))
                 if not f.supports_version(self.account.version):
@@ -3275,7 +4173,7 @@ class BaseItemTest(EWSTest):
         only_fields = ('subject', 'body', 'categories')
         items = self.test_folder.filter(categories__contains=item.categories).only(*only_fields)
         for item in items:
-            assert isinstance(item, self.ITEM_CLASS)
+            self.assertIsInstance(item, self.ITEM_CLASS)
             for f in self.ITEM_CLASS.FIELDS:
                 self.assertTrue(hasattr(item, f.name))
                 if not f.supports_version(self.account.version):
@@ -3321,6 +4219,9 @@ class BaseItemTest(EWSTest):
             if f.name == 'reminder_due_by':
                 # EWS sets a default value if it is not set on insert. Ignore
                 continue
+            if f.name == 'mime_content':
+                # This will change depending on other contents fields
+                continue
             if f.is_list:
                 old, new = set(old or ()), set(new or ())
             self.assertEqual(old, new, (f.name, old, new))
@@ -3339,20 +4240,34 @@ class BaseItemTest(EWSTest):
             if f.is_read_only and old is None:
                 # Some fields are automatically updated server-side
                 continue
+            if f.name == 'mime_content':
+                # This will change depending on other contents fields
+                continue
             if f.name == 'reminder_due_by':
                 if new is None:
-                    # EWS does not always return a value if reminder_is_set is False. Set one now
-                    new = old
-                if (new - old).days == 30:
-                    # Sometimes, 'reminder_due_by' is just set to 30 days ahead of what we requested. Yay.
+                    # EWS does not always return a value if reminder_is_set is False.
                     continue
+                if old is not None:
+                    # EWS sometimes randomly sets the new reminder due date to one month before or after we
+                    # wanted it, and sometimes 30 days before or after. But only sometimes...
+                    old_date = old.astimezone(self.account.default_timezone).date()
+                    new_date = new.astimezone(self.account.default_timezone).date()
+                    if relativedelta(month=1) + new_date == old_date:
+                        item.reminder_due_by = new
+                        continue
+                    if relativedelta(month=1) + old_date == new_date:
+                        item.reminder_due_by = new
+                        continue
+                    elif abs(old_date - new_date) == datetime.timedelta(days=30):
+                        item.reminder_due_by = new
+                        continue
             if f.is_list:
                 old, new = set(old or ()), set(new or ())
             self.assertEqual(old, new, (f.name, old, new))
 
         # Hard delete
         item_id = (item.item_id, item.changekey)
-        item.delete(affected_task_occurrences=ALL_OCCURRENCIES)
+        item.delete()
         for e in self.account.fetch(ids=[item_id]):
             # It's gone from the account
             self.assertIsInstance(e, ErrorItemNotFound)
@@ -3380,11 +4295,11 @@ class BaseItemTest(EWSTest):
     def test_soft_delete(self):
         # First, empty trash bin
         self.account.trash.filter(categories__contains=self.categories).delete()
-        self.account.recoverable_deleted_items.filter(categories__contains=self.categories).delete()
+        self.account.recoverable_items_deletions.filter(categories__contains=self.categories).delete()
         item = self.get_test_item().save()
         item_id = (item.item_id, item.changekey)
         # Soft delete
-        item.soft_delete(affected_task_occurrences=ALL_OCCURRENCIES)
+        item.soft_delete()
         for e in self.account.fetch(ids=[item_id]):
             # It's gone from the test folder
             self.assertIsInstance(e, ErrorItemNotFound)
@@ -3392,7 +4307,7 @@ class BaseItemTest(EWSTest):
         self.assertEqual(len(self.test_folder.filter(categories__contains=item.categories)), 0)
         self.assertEqual(len(self.account.trash.filter(categories__contains=item.categories)), 0)
         # But we can find it in the recoverable items folder
-        self.assertEqual(len(self.account.recoverable_deleted_items.filter(categories__contains=item.categories)), 1)
+        self.assertEqual(len(self.account.recoverable_items_deletions.filter(categories__contains=item.categories)), 1)
 
     def test_move_to_trash(self):
         # First, empty trash bin
@@ -3400,7 +4315,7 @@ class BaseItemTest(EWSTest):
         item = self.get_test_item().save()
         item_id = (item.item_id, item.changekey)
         # Move to trash
-        item.move_to_trash(affected_task_occurrences=ALL_OCCURRENCIES)
+        item.move_to_trash()
         for e in self.account.fetch(ids=[item_id]):
             # Not in the test folder anymore
             self.assertIsInstance(e, ErrorItemNotFound)
@@ -3411,6 +4326,21 @@ class BaseItemTest(EWSTest):
         moved_item = list(self.account.fetch(ids=[item]))[0]
         # The item was copied, so the ItemId has changed. Let's compare the subject instead
         self.assertEqual(item.subject, moved_item.subject)
+
+    def test_copy(self):
+        # First, empty trash bin
+        self.account.trash.filter(categories__contains=self.categories).delete()
+        item = self.get_test_item().save()
+        # Copy to trash. We use trash because it can contain all item types.
+        copy_item_id, copy_changekey = item.copy(to_folder=self.account.trash)
+        # Test that the item still exists in the folder
+        self.assertEqual(len(self.test_folder.filter(categories__contains=item.categories)), 1)
+        # Test that the copied item exists in trash
+        copied_item = self.account.trash.get(categories__contains=item.categories)
+        self.assertNotEqual(item.item_id, copied_item.item_id)
+        self.assertNotEqual(item.changekey, copied_item.changekey)
+        self.assertEqual(copy_item_id, copied_item.item_id)
+        self.assertEqual(copy_changekey, copied_item.changekey)
 
     def test_move(self):
         # First, empty trash bin
@@ -3435,7 +4365,7 @@ class BaseItemTest(EWSTest):
         item.subject = 'XXX'
         item.refresh()
         self.assertEqual(item.subject, orig_subject)
-        item.delete(affected_task_occurrences=ALL_OCCURRENCIES)
+        item.delete()
         with self.assertRaises(ValueError):
             # Item no longer has an ID
             item.refresh()
@@ -3451,7 +4381,7 @@ class BaseItemTest(EWSTest):
         # Test with generator as argument
         insert_ids = self.test_folder.bulk_create(items=(i for i in [item]))
         self.assertEqual(len(insert_ids), 1)
-        assert isinstance(insert_ids[0], Item)
+        self.assertIsInstance(insert_ids[0], Item)
         find_ids = self.test_folder.filter(categories__contains=item.categories).values_list('item_id', 'changekey')
         self.assertEqual(len(find_ids), 1)
         self.assertEqual(len(find_ids[0]), 2, find_ids[0])
@@ -3467,6 +4397,9 @@ class BaseItemTest(EWSTest):
             if f.name == 'reminder_due_by':
                 # EWS sets a default value if it is not set on insert. Ignore
                 continue
+            if f.name == 'mime_content':
+                # This will change depending on other contents fields
+                continue
             old, new = getattr(item, f.name), insert_kwargs[f.name]
             if f.is_list:
                 old, new = set(old or ()), set(new or ())
@@ -3474,6 +4407,9 @@ class BaseItemTest(EWSTest):
 
         # Test update
         update_kwargs = self.get_random_update_kwargs(item=item, insert_kwargs=insert_kwargs)
+        if self.ITEM_CLASS in (Contact, DistributionList):
+            # Contact and DistributionList don't support mime_type updates at all
+            update_kwargs.pop('mime_content', None)
         update_fieldnames = [f for f in update_kwargs.keys() if f != 'attachments']
         for k, v in update_kwargs.items():
             setattr(item, k, v)
@@ -3488,18 +4424,32 @@ class BaseItemTest(EWSTest):
             if not f.supports_version(self.account.version):
                 # Cannot be used with this EWS version
                 continue
-            if f.is_read_only:
+            if f.is_read_only or f.is_read_only_after_send:
+                # These cannot be changed
+                continue
+            if f.name == 'mime_content':
+                # This will change depending on other contents fields
                 continue
             old, new = getattr(item, f.name), update_kwargs[f.name]
-            if f.name == 'reminder_due_by' and old is None:
-                # EWS does not always return a value if reminder_is_set is False. Set one now
-                old = new
-                item.reminder_due_by = new
-            if f.name == 'reminder_due_by' and old is not None and new is not None:
-                # EWS sometimes randomly sets the new reminder due date to 30 days before we wanted it(!)
-                if old - new == datetime.timedelta(30):
-                    old = new
+            if f.name == 'reminder_due_by':
+                if old is None:
+                    # EWS does not always return a value if reminder_is_set is False. Set one now
                     item.reminder_due_by = new
+                    continue
+                elif old is not None and new is not None:
+                    # EWS sometimes randomly sets the new reminder due date to one month before or after we
+                    # wanted it, and sometimes 30 days before or after. But only sometimes...
+                    old_date = old.astimezone(self.account.default_timezone).date()
+                    new_date = new.astimezone(self.account.default_timezone).date()
+                    if relativedelta(month=1) + new_date == old_date:
+                        item.reminder_due_by = new
+                        continue
+                    if relativedelta(month=1) + old_date == new_date:
+                        item.reminder_due_by = new
+                        continue
+                    elif abs(old_date - new_date) == datetime.timedelta(days=30):
+                        item.reminder_due_by = new
+                        continue
             if f.is_list:
                 old, new = set(old or ()), set(new or ())
             self.assertEqual(old, new, (f.name, old, new))
@@ -3513,7 +4463,7 @@ class BaseItemTest(EWSTest):
             if f.is_required or f.is_required_after_save:
                 # These cannot be deleted
                 continue
-            if f.is_read_only:
+            if f.is_read_only or f.is_read_only_after_send:
                 # These cannot be changed
                 continue
             wipe_kwargs[f.name] = None
@@ -3532,7 +4482,7 @@ class BaseItemTest(EWSTest):
                 continue
             if f.is_required or f.is_required_after_save:
                 continue
-            if f.is_read_only:
+            if f.is_read_only or f.is_read_only_after_send:
                 continue
             old, new = getattr(item, f.name), wipe_kwargs[f.name]
             if f.is_list:
@@ -3558,7 +4508,7 @@ class BaseItemTest(EWSTest):
         items = [self.get_test_item().save() for _ in range(15)]
         ids = [(i.item_id, i.changekey) for i in items]
         # re-fetch items because there will be some extra fields added by the server
-        items = list(self.test_folder.fetch(items))
+        items = list(self.account.fetch(items))
 
         # Try exporting and making sure we get the right response
         export_results = self.account.export(items)
@@ -3568,7 +4518,7 @@ class BaseItemTest(EWSTest):
 
         # Try reuploading our results
         upload_results = self.account.upload([(self.test_folder, data) for data in export_results])
-        self.assertEqual(len(items), len(upload_results))
+        self.assertEqual(len(items), len(upload_results), (items, upload_results))
         for result in upload_results:
             # Must be a completely new ItemId
             self.assertIsInstance(result, tuple)
@@ -3580,9 +4530,13 @@ class BaseItemTest(EWSTest):
             # fieldnames is everything except the ID so we'll use it to compare
             for f in item.FIELDS:
                 # datetime_created and last_modified_time aren't copied, but instead are added to the new item after
-                # uploading. This means mime_content can also change. Items also get new IDs on upload.
+                # uploading. This means mime_content and size can also change. Items also get new IDs on upload. And
+                # meeting_count values are dependent on contents of current calendar. Form query strings contain the
+                # item ID and will also change.
                 if f.name in {'item_id', 'changekey', 'first_occurrence', 'last_occurrence', 'datetime_created',
-                              'last_modified_time', 'mime_content'}:
+                              'last_modified_time', 'mime_content', 'size', 'conversation_id',
+                              'adjacent_meeting_count', 'conflicting_meeting_count',
+                              'web_client_read_form_query_string', 'web_client_edit_form_query_string'}:
                     continue
                 dict_item[f.name] = getattr(item, f.name)
                 if f.name == 'attachments':
@@ -3591,7 +4545,7 @@ class BaseItemTest(EWSTest):
                         a.attachment_id = None
             return dict_item
 
-        uploaded_items = sorted([to_dict(item) for item in self.test_folder.fetch(upload_results)],
+        uploaded_items = sorted([to_dict(item) for item in self.account.fetch(upload_results)],
                                 key=lambda i: i['subject'])
         original_items = sorted([to_dict(item) for item in items], key=lambda i: i['subject'])
         self.assertListEqual(original_items, uploaded_items)
@@ -3607,7 +4561,7 @@ class BaseItemTest(EWSTest):
         #  id.
         ids = [(item.item_id, item.changekey) for item in items]
         # Delete one of the items, this will cause an error
-        items[3].delete(affected_task_occurrences=ALL_OCCURRENCIES)
+        items[3].delete()
 
         export_results = self.account.export(ids)
         self.assertEqual(len(items), len(export_results))
@@ -3639,30 +4593,31 @@ class BaseItemTest(EWSTest):
             self.ITEM_CLASS.deregister('subject')  # Not an extended property
 
         self.ITEM_CLASS.register(attr_name=attr_name, attr_cls=TestProp)
+        try:
+            # After register
+            self.assertEqual(TestProp.python_type(), int)
+            self.assertIn(attr_name, {f.name for f in self.ITEM_CLASS.supported_fields()})
 
-        # After register
-        self.assertEqual(TestProp.python_type(), int)
-        self.assertIn(attr_name, {f.name for f in self.ITEM_CLASS.supported_fields()})
+            # Test item creation, refresh, and update
+            item = self.get_test_item(folder=self.test_folder)
+            prop_val = item.dead_beef
+            self.assertTrue(isinstance(prop_val, int))
+            item.save()
+            item.refresh()
+            self.assertEqual(prop_val, item.dead_beef)
+            new_prop_val = get_random_int(0, 256)
+            item.dead_beef = new_prop_val
+            item.save()
+            item.refresh()
+            self.assertEqual(new_prop_val, item.dead_beef)
 
-        # Test item creation, refresh, and update
-        item = self.get_test_item(folder=self.test_folder)
-        prop_val = item.dead_beef
-        self.assertTrue(isinstance(prop_val, int))
-        item.save()
-        item.refresh()
-        self.assertEqual(prop_val, item.dead_beef)
-        new_prop_val = get_random_int(0, 256)
-        item.dead_beef = new_prop_val
-        item.save()
-        item.refresh()
-        self.assertEqual(new_prop_val, item.dead_beef)
-
-        # Test deregister
-        with self.assertRaises(ValueError):
-            self.ITEM_CLASS.register(attr_name=attr_name, attr_cls=TestProp)  # Already registered
-        with self.assertRaises(ValueError):
-            self.ITEM_CLASS.register(attr_name='XXX', attr_cls=Mailbox)  # Not an extended property
-        self.ITEM_CLASS.deregister(attr_name=attr_name)
+            # Test deregister
+            with self.assertRaises(ValueError):
+                self.ITEM_CLASS.register(attr_name=attr_name, attr_cls=TestProp)  # Already registered
+            with self.assertRaises(ValueError):
+                self.ITEM_CLASS.register(attr_name='XXX', attr_cls=Mailbox)  # Not an extended property
+        finally:
+            self.ITEM_CLASS.deregister(attr_name=attr_name)
         self.assertNotIn(attr_name, {f.name for f in self.ITEM_CLASS.supported_fields()})
 
     def test_extended_property_arraytype(self):
@@ -3674,21 +4629,21 @@ class BaseItemTest(EWSTest):
 
         attr_name = 'dead_beef_array'
         self.ITEM_CLASS.register(attr_name=attr_name, attr_cls=TestArayProp)
-
-        # Test item creation, refresh, and update
-        item = self.get_test_item(folder=self.test_folder)
-        prop_val = item.dead_beef_array
-        self.assertTrue(isinstance(prop_val, list))
-        item.save()
-        item.refresh()
-        self.assertEqual(prop_val, item.dead_beef_array)
-        new_prop_val = self.random_val(self.ITEM_CLASS.get_field_by_fieldname(attr_name))
-        item.dead_beef_array = new_prop_val
-        item.save()
-        item.refresh()
-        self.assertEqual(new_prop_val, item.dead_beef_array)
-
-        self.ITEM_CLASS.deregister(attr_name=attr_name)
+        try:
+            # Test item creation, refresh, and update
+            item = self.get_test_item(folder=self.test_folder)
+            prop_val = item.dead_beef_array
+            self.assertTrue(isinstance(prop_val, list))
+            item.save()
+            item.refresh()
+            self.assertEqual(prop_val, item.dead_beef_array)
+            new_prop_val = self.random_val(self.ITEM_CLASS.get_field_by_fieldname(attr_name))
+            item.dead_beef_array = new_prop_val
+            item.save()
+            item.refresh()
+            self.assertEqual(new_prop_val, item.dead_beef_array)
+        finally:
+            self.ITEM_CLASS.deregister(attr_name=attr_name)
 
     def test_extended_property_with_tag(self):
         class Flag(ExtendedProperty):
@@ -3697,21 +4652,21 @@ class BaseItemTest(EWSTest):
 
         attr_name = 'my_flag'
         self.ITEM_CLASS.register(attr_name=attr_name, attr_cls=Flag)
-
-        # Test item creation, refresh, and update
-        item = self.get_test_item(folder=self.test_folder)
-        prop_val = item.my_flag
-        self.assertTrue(isinstance(prop_val, int))
-        item.save()
-        item.refresh()
-        self.assertEqual(prop_val, item.my_flag)
-        new_prop_val = self.random_val(self.ITEM_CLASS.get_field_by_fieldname(attr_name))
-        item.my_flag = new_prop_val
-        item.save()
-        item.refresh()
-        self.assertEqual(new_prop_val, item.my_flag)
-
-        self.ITEM_CLASS.deregister(attr_name=attr_name)
+        try:
+            # Test item creation, refresh, and update
+            item = self.get_test_item(folder=self.test_folder)
+            prop_val = item.my_flag
+            self.assertTrue(isinstance(prop_val, int))
+            item.save()
+            item.refresh()
+            self.assertEqual(prop_val, item.my_flag)
+            new_prop_val = self.random_val(self.ITEM_CLASS.get_field_by_fieldname(attr_name))
+            item.my_flag = new_prop_val
+            item.save()
+            item.refresh()
+            self.assertEqual(new_prop_val, item.my_flag)
+        finally:
+            self.ITEM_CLASS.deregister(attr_name=attr_name)
 
     def test_extended_property_with_invalid_tag(self):
         class InvalidProp(ExtendedProperty):
@@ -3728,23 +4683,26 @@ class BaseItemTest(EWSTest):
 
         attr_name = 'my_flag'
         self.ITEM_CLASS.register(attr_name=attr_name, attr_cls=Flag)
-
-        # Test item creation, refresh, and update
-        item = self.get_test_item(folder=self.test_folder)
-        prop_val = item.my_flag
-        self.assertTrue(isinstance(prop_val, int))
-        item.save()
-        item.refresh()
-        self.assertEqual(prop_val, item.my_flag)
-        new_prop_val = self.random_val(self.ITEM_CLASS.get_field_by_fieldname(attr_name))
-        item.my_flag = new_prop_val
-        item.save()
-        item.refresh()
-        self.assertEqual(new_prop_val, item.my_flag)
-
-        self.ITEM_CLASS.deregister(attr_name=attr_name)
+        try:
+            # Test item creation, refresh, and update
+            item = self.get_test_item(folder=self.test_folder)
+            prop_val = item.my_flag
+            self.assertTrue(isinstance(prop_val, int))
+            item.save()
+            item.refresh()
+            self.assertEqual(prop_val, item.my_flag)
+            new_prop_val = self.random_val(self.ITEM_CLASS.get_field_by_fieldname(attr_name))
+            item.my_flag = new_prop_val
+            item.save()
+            item.refresh()
+            self.assertEqual(new_prop_val, item.my_flag)
+        finally:
+            self.ITEM_CLASS.deregister(attr_name=attr_name)
 
     def test_extended_distinguished_property(self):
+        if self.ITEM_CLASS == CalendarItem:
+            raise self.skipTest("This extendedproperty doesn't work on CalendarItems")
+
         class MyMeeting(ExtendedProperty):
             distinguished_property_set_id = 'Meeting'
             property_type = 'Binary'
@@ -3752,26 +4710,26 @@ class BaseItemTest(EWSTest):
 
         attr_name = 'my_meeting'
         self.ITEM_CLASS.register(attr_name=attr_name, attr_cls=MyMeeting)
-
-        # Test item creation, refresh, and update
-        item = self.get_test_item(folder=self.test_folder)
-        # MyMeeting is an extended prop version of the CalendarItem 'uid' field. We don't want 'uid' to overwrite that.
-        # overwriting each other.
-        item.uid = None
-        prop_val = item.my_meeting
-        self.assertTrue(isinstance(prop_val, bytes))
-        item.save()
-        item = list(self.account.fetch(ids=[(item.item_id, item.changekey)]))[0]
-        self.assertEqual(prop_val, item.my_meeting, (prop_val, item.my_meeting))
-        new_prop_val = self.random_val(self.ITEM_CLASS.get_field_by_fieldname(attr_name))
-        item.my_meeting = new_prop_val
-        # MyMeeting is an extended prop version of the CalendarItem 'uid' field. We don't want 'uid' to overwrite that.
-        item.uid = None
-        item.save()
-        item = list(self.account.fetch(ids=[(item.item_id, item.changekey)]))[0]
-        self.assertEqual(new_prop_val, item.my_meeting)
-
-        self.ITEM_CLASS.deregister(attr_name=attr_name)
+        try:
+            # Test item creation, refresh, and update
+            item = self.get_test_item(folder=self.test_folder)
+            # MyMeeting is an extended prop version of the 'uid' field. We don't want 'uid' to overwrite that.
+            # overwriting each other.
+            item.uid = None
+            prop_val = item.my_meeting
+            self.assertTrue(isinstance(prop_val, bytes))
+            item.save()
+            item = list(self.account.fetch(ids=[(item.item_id, item.changekey)]))[0]
+            self.assertEqual(prop_val, item.my_meeting, (prop_val, item.my_meeting))
+            new_prop_val = self.random_val(self.ITEM_CLASS.get_field_by_fieldname(attr_name))
+            item.my_meeting = new_prop_val
+            # MyMeeting is an extended prop version of the 'uid' field. We don't want 'uid' to overwrite that.
+            item.uid = None
+            item.save()
+            item = list(self.account.fetch(ids=[(item.item_id, item.changekey)]))[0]
+            self.assertEqual(new_prop_val, item.my_meeting)
+        finally:
+            self.ITEM_CLASS.deregister(attr_name=attr_name)
 
     def test_extended_property_binary_array(self):
         class MyMeetingArray(ExtendedProperty):
@@ -3782,20 +4740,114 @@ class BaseItemTest(EWSTest):
         attr_name = 'my_meeting_array'
         self.ITEM_CLASS.register(attr_name=attr_name, attr_cls=MyMeetingArray)
 
-        # Test item creation, refresh, and update
-        item = self.get_test_item(folder=self.test_folder)
-        prop_val = item.my_meeting_array
-        self.assertTrue(isinstance(prop_val, list))
-        item.save()
-        item = list(self.account.fetch(ids=[(item.item_id, item.changekey)]))[0]
-        self.assertEqual(prop_val, item.my_meeting_array)
-        new_prop_val = self.random_val(self.ITEM_CLASS.get_field_by_fieldname(attr_name))
-        item.my_meeting_array = new_prop_val
-        item.save()
-        item = list(self.account.fetch(ids=[(item.item_id, item.changekey)]))[0]
-        self.assertEqual(new_prop_val, item.my_meeting_array)
+        try:
+            # Test item creation, refresh, and update
+            item = self.get_test_item(folder=self.test_folder)
+            prop_val = item.my_meeting_array
+            self.assertTrue(isinstance(prop_val, list))
+            item.save()
+            item = list(self.account.fetch(ids=[(item.item_id, item.changekey)]))[0]
+            self.assertEqual(prop_val, item.my_meeting_array)
+            new_prop_val = self.random_val(self.ITEM_CLASS.get_field_by_fieldname(attr_name))
+            item.my_meeting_array = new_prop_val
+            item.save()
+            item = list(self.account.fetch(ids=[(item.item_id, item.changekey)]))[0]
+            self.assertEqual(new_prop_val, item.my_meeting_array)
+        finally:
+            self.ITEM_CLASS.deregister(attr_name=attr_name)
 
-        self.ITEM_CLASS.deregister(attr_name=attr_name)
+    def test_extended_property_validation(self):
+        """
+        if cls.property_type not in cls.PROPERTY_TYPES:
+            raise ValueError(
+                "'property_type' value '%s' must be one of %s" % (cls.property_type, sorted(cls.PROPERTY_TYPES))
+            )
+        """
+        # Must not have property_set_id or property_tag
+        class TestProp(ExtendedProperty):
+            distinguished_property_set_id = 'XXX'
+            property_set_id = 'YYY'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # Must have property_id or property_name
+        class TestProp(ExtendedProperty):
+            distinguished_property_set_id = 'XXX'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # distinguished_property_set_id must have a valid value
+        class TestProp(ExtendedProperty):
+            distinguished_property_set_id = 'XXX'
+            property_id = 'YYY'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # Must not have distinguished_property_set_id or property_tag
+        class TestProp(ExtendedProperty):
+            property_set_id = 'XXX'
+            property_tag = 'YYY'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # Must have property_id or property_name
+        class TestProp(ExtendedProperty):
+            property_set_id = 'XXX'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # property_tag is only compatible with property_type
+        class TestProp(ExtendedProperty):
+            property_tag = 'XXX'
+            property_set_id = 'YYY'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # property_tag must be an integer or string that can be converted to int
+        class TestProp(ExtendedProperty):
+            property_tag = 'XXX'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # property_tag must not be in the reserved range
+        class TestProp(ExtendedProperty):
+            property_tag = 0x8001
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # Must not have property_id or property_tag
+        class TestProp(ExtendedProperty):
+            property_name = 'XXX'
+            property_id = 'YYY'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # Must have distinguished_property_set_id or property_set_id
+        class TestProp(ExtendedProperty):
+            property_name = 'XXX'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # Must not have property_name or property_tag
+        class TestProp(ExtendedProperty):
+            property_id = 'XXX'
+            property_name = 'YYY'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()  # This actually hits the check on property_name values
+
+        # Must have distinguished_property_set_id or property_set_id
+        class TestProp(ExtendedProperty):
+            property_id = 'XXX'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
+
+        # property_type must be a valid value
+        class TestProp(ExtendedProperty):
+            property_id = 'XXX'
+            property_set_id = 'YYY'
+            property_type = 'ZZZ'
+        with self.assertRaises(ValueError):
+            TestProp.validate_cls()
 
     def test_attachment_failure(self):
         att1 = FileAttachment(name='my_file_1.txt', content=u'Hello from unicode æøå'.encode('utf-8'))
@@ -3924,6 +4976,9 @@ class BaseItemTest(EWSTest):
             if f.name == 'reminder_due_by':
                 # EWS sets a default value if it is not set on insert. Ignore
                 continue
+            if f.name == 'mime_content':
+                # This will change depending on other contents fields
+                continue
             old_val = getattr(attached_item1, f.name)
             new_val = getattr(fresh_attachments[0].item, f.name)
             if f.is_list:
@@ -3959,6 +5014,9 @@ class BaseItemTest(EWSTest):
             if f.name == 'is_read':
                 # This is always true for item attachments?
                 continue
+            if f.name == 'mime_content':
+                # This will change depending on other contents fields
+                continue
             old_val = getattr(attached_item1, f.name)
             new_val = getattr(fresh_attachments[0].item, f.name)
             if f.is_list:
@@ -3980,6 +5038,9 @@ class BaseItemTest(EWSTest):
                 continue
             if f.name == 'is_read':
                 # This is always true for item attachments?
+                continue
+            if f.name == 'mime_content':
+                # This will change depending on other contents fields
                 continue
             old_val = getattr(attached_item2, f.name)
             new_val = getattr(fresh_attachments[1].item, f.name)
@@ -4008,6 +5069,9 @@ class BaseItemTest(EWSTest):
             if f.name == 'is_read':
                 # This is always true for item attachments?
                 continue
+            if f.name == 'mime_content':
+                # This will change depending on other contents fields
+                continue
             old_val = getattr(attached_item1, f.name)
             new_val = getattr(fresh_attachments[0].item, f.name)
             if f.is_list:
@@ -4023,18 +5087,48 @@ class BaseItemTest(EWSTest):
         item.attach(attachment3)
         item.detach(attachment3)
 
+    def test_recursive_attachments(self):
+        # Test that we can handle an item which has an attached item, which has an attached item...
+        item = self.get_test_item(folder=self.test_folder)
+        attached_item_level_1 = self.get_test_item(folder=self.test_folder)
+        attached_item_level_2 = self.get_test_item(folder=self.test_folder)
+        attached_item_level_3 = self.get_test_item(folder=self.test_folder)
+
+        attached_item_level_3.save()
+        attachment_level_3 = ItemAttachment(name='attached_item_level_3', item=attached_item_level_3)
+        attached_item_level_2.attach(attachment_level_3)
+        attached_item_level_2.save()
+        attachment_level_2 = ItemAttachment(name='attached_item_level_2', item=attached_item_level_2)
+        attached_item_level_1.attach(attachment_level_2)
+        attached_item_level_1.save()
+        attachment_level_1 = ItemAttachment(name='attached_item_level_1', item=attached_item_level_1)
+        item.attach(attachment_level_1)
+        item.save()
+
+        self.assertEqual(
+            item.attachments[0].item.attachments[0].item.attachments[0].item.subject,
+            attached_item_level_3.subject
+        )
+
+        # Also test a fresh item
+        new_item = self.test_folder.get(item_id=item.item_id, changekey=item.changekey)
+        self.assertEqual(
+            new_item.attachments[0].item.attachments[0].item.attachments[0].item.subject,
+            attached_item_level_3.subject
+        )
+
     def test_bulk_failure(self):
         # Test that bulk_* can handle EWS errors and return the errors in order without losing non-failure results
         items1 = [self.get_test_item().save() for _ in range(3)]
         items1[1].changekey = 'XXX'
-        for i, res in enumerate(self.account.bulk_delete(items1, affected_task_occurrences=ALL_OCCURRENCIES)):
+        for i, res in enumerate(self.account.bulk_delete(items1)):
             if i == 1:
                 self.assertIsInstance(res, ErrorInvalidChangeKey)
             else:
                 self.assertEqual(res, True)
         items2 = [self.get_test_item().save() for _ in range(3)]
         items2[1].item_id = 'AAAA=='
-        for i, res in enumerate(self.account.bulk_delete(items2, affected_task_occurrences=ALL_OCCURRENCIES)):
+        for i, res in enumerate(self.account.bulk_delete(items2)):
             if i == 1:
                 self.assertIsInstance(res, ErrorInvalidIdMalformed)
             else:
@@ -4061,8 +5155,8 @@ class CalendarTest(BaseItemTest):
         # Update start, end and recurrence with timezoned datetimes. For some reason, EWS throws
         # 'ErrorOccurrenceTimeSpanTooBig' is we go back in time.
         start = get_random_date(start_date=item.start.date() + datetime.timedelta(days=1))
-        dt_start, dt_end = [dt.astimezone(self.tz) for dt in
-                            get_random_datetime_range(start_date=start, end_date=start, tz=self.tz)]
+        dt_start, dt_end = [dt.astimezone(self.account.default_timezone) for dt in
+                            get_random_datetime_range(start_date=start, end_date=start, tz=self.account.default_timezone)]
         item.start, item.end = dt_start, dt_end
         item.recurrence.boundary.start = dt_start.date()
         item.save()
@@ -4073,15 +5167,18 @@ class CalendarTest(BaseItemTest):
     def test_all_day_datetimes(self):
         # Test that start and end datetimes for all-day items are returned in the datetime of the account.
         start = get_random_date()
-        start_dt, end_dt = \
-            get_random_datetime_range(start_date=start, end_date=start + datetime.timedelta(days=365), tz=self.tz)
+        start_dt, end_dt = get_random_datetime_range(
+            start_date=start,
+            end_date=start + datetime.timedelta(days=365),
+            tz=self.account.default_timezone
+        )
         item = self.ITEM_CLASS(folder=self.test_folder, start=start_dt, end=end_dt, is_all_day=True,
                                categories=self.categories)
         item.save()
 
         item = self.test_folder.all().only('start', 'end').get(item_id=item.item_id, changekey=item.changekey)
-        self.assertEqual(item.start.astimezone(self.tz).time(), datetime.time(0, 0))
-        self.assertEqual(item.end.astimezone(self.tz).time(), datetime.time(0, 0))
+        self.assertEqual(item.start.astimezone(self.account.default_timezone).time(), datetime.time(0, 0))
+        self.assertEqual(item.end.astimezone(self.account.default_timezone).time(), datetime.time(0, 0))
         item.delete()
 
     def test_view(self):
@@ -4089,16 +5186,16 @@ class CalendarTest(BaseItemTest):
             account=self.account,
             folder=self.test_folder,
             subject=get_random_string(16),
-            start=self.tz.localize(EWSDateTime(2016, 1, 1, 8)),
-            end=self.tz.localize(EWSDateTime(2016, 1, 1, 10)),
+            start=self.account.default_timezone.localize(EWSDateTime(2016, 1, 1, 8)),
+            end=self.account.default_timezone.localize(EWSDateTime(2016, 1, 1, 10)),
             categories=self.categories,
         )
         item2 = self.ITEM_CLASS(
             account=self.account,
             folder=self.test_folder,
             subject=get_random_string(16),
-            start=self.tz.localize(EWSDateTime(2016, 2, 1, 8)),
-            end=self.tz.localize(EWSDateTime(2016, 2, 1, 10)),
+            start=self.account.default_timezone.localize(EWSDateTime(2016, 2, 1, 8)),
+            end=self.account.default_timezone.localize(EWSDateTime(2016, 2, 1, 10)),
             categories=self.categories,
         )
         self.test_folder.bulk_create(items=[item1, item2])
@@ -4155,6 +5252,58 @@ class CalendarTest(BaseItemTest):
         self.assertListEqual(
             [i for i in qs.order_by('subject').values('subject') if i['subject'] in (item1.subject, item2.subject)],
             [{'subject': s} for s in sorted([item1.subject, item2.subject])]
+        )
+
+    def test_recurring_items(self):
+        item = CalendarItem(
+            folder=self.test_folder,
+            start=self.account.default_timezone.localize(EWSDateTime(2017, 9, 4, 11)),
+            end=self.account.default_timezone.localize(EWSDateTime(2017, 9, 4, 13)),
+            subject='Hello Recurrence',
+            recurrence=Recurrence(
+                pattern=WeeklyPattern(interval=3, weekdays=[MONDAY, WEDNESDAY]),
+                start=EWSDate(2017, 9, 4),
+                number=7
+            ),
+            categories=self.categories,
+        ).save()
+
+        # Occurrence data for the master item
+        fresh_item = self.test_folder.get(item_id=item.item_id, changekey=item.changekey)
+        self.assertEqual(
+            str(fresh_item.recurrence),
+            'Pattern: Occurs on weekdays Monday, Wednesday of every 3 week(s) where the first day of the week is '
+            'Monday, Boundary: NumberedPattern(start=EWSDate(2017, 9, 4), number=7)'
+        )
+        self.assertIsInstance(fresh_item.first_occurrence, FirstOccurrence)
+        self.assertEqual(fresh_item.first_occurrence.start, self.account.default_timezone.localize(EWSDateTime(2017, 9, 4, 11)))
+        self.assertEqual(fresh_item.first_occurrence.end, self.account.default_timezone.localize(EWSDateTime(2017, 9, 4, 13)))
+        self.assertIsInstance(fresh_item.last_occurrence, LastOccurrence)
+        self.assertEqual(fresh_item.last_occurrence.start, self.account.default_timezone.localize(EWSDateTime(2017, 11, 6, 11)))
+        self.assertEqual(fresh_item.last_occurrence.end, self.account.default_timezone.localize(EWSDateTime(2017, 11, 6, 13)))
+        self.assertEqual(fresh_item.modified_occurrences, None)
+        self.assertEqual(fresh_item.deleted_occurrences, None)
+
+        # All occurrences expanded
+        all_start_times = []
+        for i in self.test_folder.view(
+                start=self.account.default_timezone.localize(EWSDateTime(2017, 9, 1)),
+                end=self.account.default_timezone.localize(EWSDateTime(2017, 12, 1))
+        ).only('start', 'categories').order_by('start'):
+            if i.categories != self.categories:
+                continue
+            all_start_times.append(i.start)
+        self.assertListEqual(
+            all_start_times,
+            [
+                self.account.default_timezone.localize(EWSDateTime(2017, 9, 4, 11)),
+                self.account.default_timezone.localize(EWSDateTime(2017, 9, 6, 11)),
+                self.account.default_timezone.localize(EWSDateTime(2017, 9, 25, 11)),
+                self.account.default_timezone.localize(EWSDateTime(2017, 9, 27, 11)),
+                self.account.default_timezone.localize(EWSDateTime(2017, 10, 16, 11)),
+                self.account.default_timezone.localize(EWSDateTime(2017, 10, 18, 11)),
+                self.account.default_timezone.localize(EWSDateTime(2017, 11, 6, 11)),
+            ]
         )
 
 
@@ -4221,10 +5370,113 @@ class MessagesTest(BaseItemTest):
         self.assertEqual(len(ids), 1)
         self.bulk_delete(ids)
 
+    def test_reply(self):
+        # Test that we can reply to a Message item. EWS only allows items that have been sent to receive a reply
+        item = self.get_test_item()
+        item.folder = None
+        item.send()  # get_test_item() sets the to_recipients to the test account
+        for _ in range(30):
+            try:
+                sent_item = self.account.inbox.get(subject=item.subject)
+                break
+            except DoesNotExist:
+                time.sleep(1)
+        else:
+            assert False, 'Gave up waiting for the sent item to show up in the inbox'
+        new_subject = ('Re: %s' % sent_item.subject)[:255]
+        sent_item.reply(subject=new_subject, body='Hello reply', to_recipients=[item.author])
+        for _ in range(30):
+            try:
+                reply = self.account.inbox.get(subject=new_subject)
+                break
+            except DoesNotExist:
+                time.sleep(1)
+        else:
+            assert False, 'Gave up waiting for the reply to show up in the inbox'
+        self.account.bulk_delete([sent_item, reply])
+
+    def test_reply_all(self):
+        # Test that we can reply-all a Message item. EWS only allows items that have been sent to receive a reply
+        item = self.get_test_item(folder=None)
+        item.folder = None
+        item.send()
+        for _ in range(30):
+            try:
+                sent_item = self.account.inbox.get(subject=item.subject)
+                break
+            except DoesNotExist:
+                time.sleep(1)
+        else:
+            assert False, 'Gave up waiting for the sent item to show up in the inbox'
+        new_subject = ('Re: %s' % sent_item.subject)[:255]
+        sent_item.reply_all(subject=new_subject, body='Hello reply')
+        for _ in range(30):
+            try:
+                reply = self.account.inbox.get(subject=new_subject)
+                break
+            except DoesNotExist:
+                time.sleep(1)
+        else:
+            assert False, 'Gave up waiting for the reply to show up in the inbox'
+        self.account.bulk_delete([sent_item, reply])
+
+    def test_forward(self):
+        # Test that we can forward a Message item. EWS only allows items that have been sent to receive a reply
+        item = self.get_test_item(folder=None)
+        item.folder = None
+        item.send()
+        for _ in range(30):
+            try:
+                sent_item = self.account.inbox.get(subject=item.subject)
+                break
+            except DoesNotExist:
+                time.sleep(1)
+        else:
+            assert False, 'Gave up waiting for the sent item to show up in the inbox'
+        new_subject = ('Re: %s' % sent_item.subject)[:255]
+        sent_item.forward(subject=new_subject, body='Hello reply', to_recipients=[item.author])
+        for _ in range(30):
+            try:
+                reply = self.account.inbox.get(subject=new_subject)
+                break
+            except DoesNotExist:
+                time.sleep(1)
+        else:
+            assert False, 'Gave up waiting for the reply to show up in the inbox'
+        self.account.bulk_delete([sent_item, reply])
+
+    def test_mime_content(self):
+        # Tests the 'mime_content' field
+        subject = get_random_string(16)
+        msg = MIMEMultipart()
+        msg['From'] = self.account.primary_smtp_address
+        msg['To'] = self.account.primary_smtp_address
+        msg['Subject'] = subject
+        body = 'MIME test mail'
+        msg.attach(MIMEText(body, 'plain', _charset='utf-8'))
+        mime_content = msg.as_string().encode('utf-8')
+        item = self.ITEM_CLASS(
+            folder=self.test_folder,
+            to_recipients=[self.account.primary_smtp_address],
+            mime_content=mime_content
+        ).save()
+        self.assertEqual(self.test_folder.get(subject=subject).body, body)
+        item.delete()
+
 
 class TasksTest(BaseItemTest):
     TEST_FOLDER = 'tasks'
     ITEM_CLASS = Task
+
+    def test_complete(self):
+        item = self.get_test_item().save()
+        item.refresh()
+        self.assertNotEqual(item.status, Task.COMPLETED)
+        self.assertNotEqual(item.percent_complete, Decimal(100))
+        item.complete()
+        item.refresh()
+        self.assertEqual(item.status, Task.COMPLETED)
+        self.assertEqual(item.percent_complete, Decimal(100))
 
 
 class ContactsTest(BaseItemTest):
@@ -4286,6 +5538,10 @@ def get_random_string(length, spaces=True, special=True):
     return res
 
 
+def get_random_bytes(*args, **kwargs):
+    return get_random_string(*args, **kwargs).encode('utf-8')
+
+
 def get_random_url():
     path_len = random.randint(1, 16)
     domain_len = random.randint(1, 30)
@@ -4306,21 +5562,29 @@ def get_random_email():
     ))
 
 
-def get_random_date(start_date=EWSDate(1990, 1, 1), end_date=EWSDate(2030, 1, 1)):
+# The timezone we're testing (CET/CEST) had a DST date change in 1996 (see
+# https://en.wikipedia.org/wiki/Summer_Time_in_Europe). The Microsoft timezone definition on the server
+# does not observe that, but pytz does. So random datetimes before 1996 will fail tests randomly.
+
+def get_random_date(start_date=EWSDate(1996, 1, 1), end_date=EWSDate(2030, 1, 1)):
     # Keep with a reasonable date range. A wider date range is unstable WRT timezones
     return EWSDate.fromordinal(random.randint(start_date.toordinal(), end_date.toordinal()))
 
 
-def get_random_datetime(start_date=EWSDate(1990, 1, 1), end_date=EWSDate(2030, 1, 1), tz=UTC):
+def get_random_datetime(start_date=EWSDate(1996, 1, 1), end_date=EWSDate(2030, 1, 1), tz=UTC):
     # Create a random datetime with minute precision. Both dates are inclusive.
     # Keep with a reasonable date range. A wider date range than the default values is unstable WRT timezones.
-    random_date = get_random_date(start_date=start_date, end_date=end_date)
-    random_datetime = datetime.datetime.combine(random_date, datetime.time.min) \
-        + datetime.timedelta(minutes=random.randint(0, 60 * 24))
-    return tz.localize(EWSDateTime.from_datetime(random_datetime))
+    while True:
+        try:
+            random_date = get_random_date(start_date=start_date, end_date=end_date)
+            random_datetime = datetime.datetime.combine(random_date, datetime.time.min) \
+                + datetime.timedelta(minutes=random.randint(0, 60 * 24))
+            return tz.localize(EWSDateTime.from_datetime(random_datetime), is_dst=None)
+        except (AmbiguousTimeError, NonExistentTimeError):
+            pass
 
 
-def get_random_datetime_range(start_date=EWSDate(1990, 1, 1), end_date=EWSDate(2030, 1, 1), tz=UTC):
+def get_random_datetime_range(start_date=EWSDate(1996, 1, 1), end_date=EWSDate(2030, 1, 1), tz=UTC):
     # Create two random datetimes.  Both dates are inclusive.
     # Keep with a reasonable date range. A wider date range than the default values is unstable WRT timezones.
     # Calendar items raise ErrorCalendarDurationIsTooLong if duration is > 5 years.
@@ -4331,10 +5595,15 @@ def get_random_datetime_range(start_date=EWSDate(1990, 1, 1), end_date=EWSDate(2
 
 
 if __name__ == '__main__':
-    import logging
+    import sys
 
-    loglevel = logging.DEBUG
-    # loglevel = logging.WARNING
-    logging.basicConfig(level=loglevel)
-    logging.getLogger('exchangelib').setLevel(loglevel)
+    if '-q' in sys.argv:
+        sys.argv.remove('-q')
+        logging.basicConfig(level=logging.WARNING)
+    else:
+        logging.basicConfig(level=logging.DEBUG, handlers=[PrettyXmlHandler()])
+
     unittest.main()
+else:
+    # Don't print warnings and stack traces mixed with test progress. We'll get the debug info for test failures later.
+    logging.basicConfig(level=logging.CRITICAL)
