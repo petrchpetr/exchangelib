@@ -46,14 +46,15 @@ BOM_LEN = len(BOM)
 def is_iterable(value, generators_allowed=False):
     """
     Checks if value is a list-like object. Don't match generators and generator-like objects here by default, because
-    callers don't necessarily guarantee that they only iterate the value once. Take care to not match string types.
+    callers don't necessarily guarantee that they only iterate the value once. Take care to not match string types and
+    bytes.
 
     :param value: any type of object
     :param generators_allowed: if True, generators will be treated as iterable
     :return: True or False
     """
     if generators_allowed:
-        if not isinstance(value, string_types) and hasattr(value, '__iter__'):
+        if not isinstance(value, string_types + (bytes,)) and hasattr(value, '__iter__'):
             return True
     else:
         if isinstance(value, (tuple, list, set)):
@@ -283,11 +284,13 @@ def is_xml(text):
 
 class PrettyXmlHandler(logging.StreamHandler):
     """A steaming log handler that prettifies log statements containing XML when output is a terminal"""
-    @staticmethod
-    def prettify_xml(xml_bytes):
+    def parse_bytes(self, xml_bytes):
+        return parse(io.BytesIO(xml_bytes))
+
+    def prettify_xml(self, xml_bytes):
         # Re-formats an XML document to a consistent style
-        return tostring(parse(
-            io.BytesIO(xml_bytes)),
+        return tostring(
+            self.parse_bytes(xml_bytes),
             xml_declaration=True,
             encoding='utf-8',
             pretty_print=True
@@ -328,6 +331,22 @@ class PrettyXmlHandler(logging.StreamHandler):
             return self.stream.isatty()
         except AttributeError:
             return False
+
+
+class AnonymizingXmlHandler(PrettyXmlHandler):
+    """A steaming log handler that prettifies and anonymizes log statements containing XML when output is a terminal"""
+    def __init__(self, forbidden_strings, *args, **kwargs):
+        self.forbidden_strings = forbidden_strings
+        super(PrettyXmlHandler, self).__init__(*args, **kwargs)
+
+    def parse_bytes(self, xml_bytes):
+        root = parse(io.BytesIO(xml_bytes))
+        for elem in root.iter():
+            for attr in set(elem.keys()) & {'RootItemId', 'ItemId', 'Id', 'RootItemChangeKey', 'ChangeKey'}:
+                elem.set(attr, 'DEADBEEF=')
+            for s in self.forbidden_strings:
+                elem.text.replace(s, '[REMOVED]')
+        return root
 
 
 class DummyRequest(object):
@@ -398,12 +417,12 @@ if not PY2:
     # Python2 does not have ConnectionResetError
     CONNECTION_ERRORS += (ConnectionResetError,)
 
-# A collection of error classes we want to handle as SSL verification errors
-SSL_ERRORS = (requests.exceptions.SSLError,)
+# A collection of error classes we want to handle as TLS verification errors
+TLS_ERRORS = (requests.exceptions.SSLError,)
 try:
-    # If pyOpenSSL is installed, requests will use it and throw this class on SSL errors
+    # If pyOpenSSL is installed, requests will use it and throw this class on TLS errors
     import OpenSSL.SSL
-    SSL_ERRORS += (OpenSSL.SSL.Error,)
+    TLS_ERRORS += (OpenSSL.SSL.Error,)
 except ImportError:
     pass
 
@@ -524,7 +543,7 @@ Response data: %(xml_response)s
 
 def _may_retry_on_error(r, protocol, wait):
     # The genericerrorpage.htm/internalerror.asp is ridiculous behaviour for random outages. Redirect to
-    # '/internalsite/internalerror.asp' or '/internalsite/initparams.aspx' is caused by e.g. SSL certificate
+    # '/internalsite/internalerror.asp' or '/internalsite/initparams.aspx' is caused by e.g. TLS certificate
     # f*ckups on the Exchange server.
     if (r.status_code == 401) \
             or (r.headers.get('connection') == 'close') \

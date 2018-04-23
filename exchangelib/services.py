@@ -38,7 +38,7 @@ from .ewsdatetime import EWSDateTime, NaiveDateTimeNotAllowed
 from .transport import wrap, extra_headers, SOAPNS, TNS, MNS, ENS
 from .util import chunkify, create_element, add_xml_child, get_xml_attr, to_xml, post_ratelimited, ElementType, \
     xml_to_str, set_xml_value, peek, xml_text_to_value
-from .version import EXCHANGE_2010, EXCHANGE_2010_SP2, EXCHANGE_2013_SP1
+from .version import EXCHANGE_2010, EXCHANGE_2010_SP2, EXCHANGE_2013, EXCHANGE_2013_SP1
 
 log = logging.getLogger(__name__)
 
@@ -172,7 +172,11 @@ class EWSService(object):
                 raise SOAPError('Bad SOAP response: %s' % e)
             try:
                 res = self._get_soap_payload(soap_response=soap_response_payload)
-            except (ErrorInvalidSchemaVersionForMailboxVersion, ErrorInvalidServerVersion):
+            except ErrorInvalidServerVersion:
+                # The guessed server version is wrong. Try the next version
+                log.debug('API version %s was invalid', api_version)
+                continue
+            except ErrorInvalidSchemaVersionForMailboxVersion:
                 if not account:
                     # This should never happen for non-account services
                     raise ValueError("'account' should not be None")
@@ -185,13 +189,14 @@ class EWSService(object):
                     self._update_api_version(hint=hint, api_version=api_version, response=r)
                 except TransportError as e:
                     log.debug('Failed to update version info (%s)', e)
-                    pass
                 raise
             else:
                 self._update_api_version(hint=hint, api_version=api_version, response=r)
             return res
-        raise ErrorInvalidSchemaVersionForMailboxVersion('Tried versions %s but all were invalid for account %s' %
-                                                         (api_versions, account))
+        if account:
+            raise ErrorInvalidSchemaVersionForMailboxVersion('Tried versions %s but all were invalid for account %s' %
+                                                             (api_versions, account))
+        raise ErrorInvalidServerVersion('Tried versions %s but all were invalid' % api_versions)
 
     def _update_api_version(self, hint, api_version, response):
         if api_version == hint.api_version and hint.build is not None:
@@ -1486,6 +1491,50 @@ class FindPeople(EWSAccountService, PagingEWSMixIn):
         return message, total_items
 
 
+class GetPersona(EWSService):
+    """
+    MSDN: https://msdn.microsoft.com/en-us/library/office/jj191408(v=exchg.150).aspx
+    """
+    SERVICE_NAME = 'GetPersona'
+
+    def call(self, persona):
+        from .items import Persona
+        elements = list(self._get_elements(payload=self.get_payload(persona=persona)))
+        if len(elements) != 1:
+            raise ValueError('Expected exactly one element in response')
+        elem = elements[0]
+        if isinstance(elem, Exception):
+            raise elem
+        return Persona.from_xml(elem=elem.find(Persona.response_tag()), account=None)
+
+    def get_payload(self, persona):
+        from .items import Persona
+        from .properties import PersonaId
+        payload = create_element('m:%s' % self.SERVICE_NAME)
+        if isinstance(persona, PersonaId):
+            set_xml_value(payload, persona, version=self.protocol.version)
+        elif isinstance(persona, Persona):
+            set_xml_value(payload, persona.persona_id, version=self.protocol.version)
+        else:
+            set_xml_value(payload, PersonaId(*persona), version=self.protocol.version)
+        return payload
+
+    @classmethod
+    def _get_soap_payload(cls, soap_response):
+        if not isinstance(soap_response, ElementType):
+            raise ValueError("'soap_response' %r must be an ElementType" % soap_response)
+        body = soap_response.find('{%s}Body' % SOAPNS)
+        if body is None:
+            raise TransportError('No Body element in SOAP response')
+        response = body.find('{%s}%sResponseMessage' % (MNS, cls.SERVICE_NAME))
+        if response is None:
+            fault = body.find('{%s}Fault' % SOAPNS)
+            if fault is None:
+                raise SOAPError('Unknown SOAP response: %s' % xml_to_str(body))
+            cls._raise_soap_errors(fault=fault)  # Will throw SOAPError or custom EWS error
+        return [response]
+
+
 class ResolveNames(EWSService):
     """
     MSDN: https://msdn.microsoft.com/en-us/library/office/aa565329(v=exchg.150).aspx
@@ -1498,6 +1547,7 @@ class ResolveNames(EWSService):
 
     def call(self, unresolved_entries, parent_folders=None, return_full_contact_data=False, search_scope=None,
              contact_data_shape=None):
+        from .items import Contact
         from .properties import Mailbox
         elements = self._get_elements(payload=self.get_payload(
             unresolved_entries=unresolved_entries,
@@ -1511,7 +1561,13 @@ class ResolveNames(EWSService):
                 continue
             if isinstance(elem, Exception):
                 raise elem
-            yield Mailbox.from_xml(elem=elem.find(Mailbox.response_tag()), account=None)
+            if return_full_contact_data:
+                yield (
+                    Mailbox.from_xml(elem=elem.find(Mailbox.response_tag()), account=None),
+                    Contact.from_xml(elem=elem.find(Contact.response_tag()), account=None),
+                )
+            else:
+                yield Mailbox.from_xml(elem=elem.find(Mailbox.response_tag()), account=None)
 
     def get_payload(self, unresolved_entries, parent_folders, return_full_contact_data, search_scope,
                     contact_data_shape):
@@ -1860,3 +1916,48 @@ class GetUserAvailability(EWSService):
 
     def _get_elements_in_container(self, container):
         return [container.find('{%s}FreeBusyView' % MNS)]
+
+
+class GetSearchableMailboxes(EWSService):
+    # MSDN: https://msdn.microsoft.com/en-us/library/office/jj900497(v=exchg.150).aspx
+    SERVICE_NAME = 'GetSearchableMailboxes'
+    element_container_name = '{%s}SearchableMailboxes' % MNS
+    failed_mailboxes_container_name = '{%s}FailedMailboxes' % MNS
+
+    def call(self, search_filter, expand_group_membership):
+        if self.protocol.version.build < EXCHANGE_2013:
+            raise NotImplementedError('%s is only supported for Exchange 2013 servers and later' % self.SERVICE_NAME)
+        from .properties import SearchableMailbox, FailedMailbox
+        for elem in self._get_elements(payload=self.get_payload(
+                search_filter=search_filter,
+                expand_group_membership=expand_group_membership,
+        )):
+            if isinstance(elem, Exception):
+                yield elem
+                continue
+            if elem.tag == SearchableMailbox.response_tag():
+                yield SearchableMailbox.from_xml(elem=elem, account=None)
+            elif elem.tag == FailedMailbox.response_tag():
+                yield FailedMailbox.from_xml(elem=elem, account=None)
+            else:
+                raise ValueError("Unknown element tag '%s': (%s)" % (elem.tag, elem))
+
+    def get_payload(self, search_filter, expand_group_membership):
+        payload = create_element('m:%s' % self.SERVICE_NAME)
+        if search_filter:
+            add_xml_child(payload, 'm:SearchFilter', search_filter)
+        if expand_group_membership is not None:
+            add_xml_child(payload, 'm:ExpandGroupMembership', 'true' if expand_group_membership else 'false')
+        return payload
+
+    def _get_elements_in_response(self, response):
+        for msg in response:
+            if not isinstance(msg, ElementType):
+                raise ValueError("'msg' %r must be an ElementType" % msg)
+            for container_name in (self.element_container_name, self.failed_mailboxes_container_name):
+                container_or_exc = self._get_element_container(message=msg, name=container_name)
+                if isinstance(container_or_exc, ElementType):
+                    for c in self._get_elements_in_container(container=container_or_exc):
+                        yield c
+                else:
+                    yield container_or_exc

@@ -498,6 +498,11 @@ class Base64Field(FieldURIField):
     value_cls = bytes
     is_complex = True
 
+    def __init__(self, *args, **kwargs):
+        if 'is_searchable' not in kwargs:
+            kwargs['is_searchable'] = False
+        super(Base64Field, self).__init__(*args, **kwargs)
+
     def from_xml(self, elem, account):
         field_elem = elem.find(self.response_tag())
         val = None if field_elem is None else field_elem.text or None
@@ -791,6 +796,18 @@ class EWSElementListField(EWSElementField):
     is_complex = True
 
 
+class AssociatedCalendarItemIdField(EWSElementField):
+    is_complex = True
+
+    def __init__(self, *args, **kwargs):
+        from .properties import AssociatedCalendarItemId
+        kwargs['value_cls'] = AssociatedCalendarItemId
+        super(AssociatedCalendarItemIdField, self).__init__(*args, **kwargs)
+
+    def to_xml(self, value, version):
+        return value.to_xml(version=version)
+
+
 class RecurrenceField(EWSElementField):
     is_complex = True
 
@@ -798,6 +815,18 @@ class RecurrenceField(EWSElementField):
         from .recurrence import Recurrence
         kwargs['value_cls'] = Recurrence
         super(RecurrenceField, self).__init__(*args, **kwargs)
+
+    def to_xml(self, value, version):
+        return value.to_xml(version=version)
+
+
+class ReferenceItemIdField(EWSElementField):
+    is_complex = True
+
+    def __init__(self, *args, **kwargs):
+        from .properties import ReferenceItemId
+        kwargs['value_cls'] = ReferenceItemId
+        super(ReferenceItemIdField, self).__init__(*args, **kwargs)
 
     def to_xml(self, value, version):
         return value.to_xml(version=version)

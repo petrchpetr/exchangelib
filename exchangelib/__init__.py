@@ -9,14 +9,19 @@ from .credentials import DELEGATE, IMPERSONATION, Credentials, ServiceAccount
 from .ewsdatetime import EWSDate, EWSDateTime, EWSTimeZone, UTC, UTC_NOW
 from .extended_properties import ExtendedProperty, ExternId
 from .folders import Folder, FolderCollection, SHALLOW, DEEP
-from .items import CalendarItem, Contact, DistributionList, Message, PostItem, Task
+from .items import AcceptItem, TentativelyAcceptItem, DeclineItem
+from .items import CalendarItem, CancelCalendarItem, Contact, DistributionList, Message, PostItem, Task
 from .mailbox import GetSearchableMailboxes, SearchableMailbox
 from .properties import Body, HTMLBody, ItemId, Mailbox, Attendee, Room, RoomList
 from .restriction import Q
 from .transport import BASIC, DIGEST, NTLM
 from .version import Build, Version
 from .settings import OofSettings
+
+__version__ = '1.11.1'
+
 __all__ = [
+    '__version__',
     'Account',
     'FileAttachment', 'ItemAttachment',
     'discover',
@@ -24,8 +29,8 @@ __all__ = [
     'DELEGATE', 'IMPERSONATION', 'Credentials', 'ServiceAccount',
     'EWSDate', 'EWSDateTime', 'EWSTimeZone', 'UTC', 'UTC_NOW',
     'ExtendedProperty',
-    'CalendarItem', 'Contact', 'DistributionList', 'Message', 'PostItem', 'Task',
-    'GetSearchableMailboxes',
+    'AcceptItem', 'TentativelyAcceptItem', 'DeclineItem',
+    'CalendarItem', 'CancelCalendarItem', 'Contact', 'DistributionList', 'Message', 'PostItem', 'Task',
     'ItemId', 'Mailbox', 'Attendee', 'Room', 'RoomList', 'Body', 'HTMLBody',
     'OofSettings',
     'Q',

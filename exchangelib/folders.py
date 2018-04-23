@@ -17,7 +17,7 @@ from .items import Item, CalendarItem, Contact, Message, Task, MeetingRequest, M
     DistributionList, RegisterMixIn, ITEM_CLASSES, ITEM_TRAVERSAL_CHOICES, SHAPE_CHOICES, IdOnly, DELETE_TYPE_CHOICES, \
     HARD_DELETE, Persona
 from .properties import ItemId, Mailbox, EWSElement, ParentFolderId
-from .queryset import QuerySet
+from .queryset import QuerySet, SearchableMixIn
 from .restriction import Restriction
 from .services import FindFolder, GetFolder, FindItem, CreateFolder, UpdateFolder, DeleteFolder, EmptyFolder, FindPeople
 from .transport import TNS, MNS
@@ -78,24 +78,6 @@ class CalendarView(EWSElement):
         super(CalendarView, self).clean(version=version)
         if self.end < self.start:
             raise ValueError("'start' must be before 'end'")
-
-
-class SearchableMixIn(object):
-    # Implements a search API for inheritance
-    def get(self, *args, **kwargs):
-        raise NotImplementedError()
-
-    def all(self):
-        raise NotImplementedError()
-
-    def none(self):
-        raise NotImplementedError()
-
-    def filter(self, *args, **kwargs):
-        raise NotImplementedError()
-
-    def exclude(self, *args, **kwargs):
-        raise NotImplementedError()
 
 
 class FolderCollection(SearchableMixIn):
@@ -305,7 +287,9 @@ class Folder(RegisterMixIn, SearchableMixIn):
     # Default item type for this folder. See http://msdn.microsoft.com/en-us/library/hh354773(v=exchg.80).aspx
     CONTAINER_CLASS = None
     supported_item_models = ITEM_CLASSES  # The Item types that this folder can contain. Default is all
-    supported_from = None  # For distinguished folders, marks the version from which the folder was introduced
+    # Marks the version from which a distinguished folder was introduced. A possibly authoritative source is:
+    # https://github.com/OfficeDev/ews-managed-api/blob/master/Enumerations/WellKnownFolderName.cs
+    supported_from = None
     LOCALIZED_NAMES = dict()  # A map of (str)locale: (tuple)localized_folder_names
     ITEM_MODEL_MAP = {cls.response_tag(): cls for cls in ITEM_CLASSES}
     FIELDS = [
@@ -579,6 +563,12 @@ class Folder(RegisterMixIn, SearchableMixIn):
     def exclude(self, *args, **kwargs):
         return FolderCollection(account=self.account, folders=[self]).exclude(*args, **kwargs)
 
+    def people(self):
+        return QuerySet(
+            folder_collection=FolderCollection(account=self.account, folders=[self]),
+            request_type=QuerySet.PERSONA,
+        )
+
     def find_people(self, q, shape=IdOnly, depth=SHALLOW, additional_fields=None, order_fields=None, page_size=None,
                     max_items=None):
         """
@@ -750,6 +740,7 @@ class Folder(RegisterMixIn, SearchableMixIn):
             # TODO: Only do this if we actually requested the 'name' field.
             kwargs['name'] = cls.DISTINGUISHED_FOLDER_ID
         elem.clear()
+        folder_cls = cls
         if cls == Folder:
             # We were called on the generic Folder class. Try to find a more specific class to return objects as.
             #
@@ -764,20 +755,24 @@ class Folder(RegisterMixIn, SearchableMixIn):
             #
             # Instead, search for a folder class using the localized name. If none are found, fall back to getting the
             # folder class by the "FolderClass" value.
-            try:
-                # TODO: fld_class.LOCALIZED_NAMES is most definitely neither complete nor authoritative
-                folder_cls = cls.folder_cls_from_folder_name(folder_name=kwargs['name'], locale=account.locale)
-                log.debug('Folder class %s matches localized folder name %s', folder_cls, kwargs['name'])
-            except KeyError:
+            #
+            # The returned XML may contain neither folder class nor name. In that case, we default
+            if kwargs['name']:
                 try:
-                    folder_cls = cls.folder_cls_from_container_class(kwargs['folder_class'])
+                    # TODO: fld_class.LOCALIZED_NAMES is most definitely neither complete nor authoritative
+                    folder_cls = cls.folder_cls_from_folder_name(folder_name=kwargs['name'], locale=account.locale)
+                    log.debug('Folder class %s matches localized folder name %s', folder_cls, kwargs['name'])
+                except KeyError:
+                    pass
+            if kwargs['folder_class'] and folder_cls == Folder:
+                try:
+                    folder_cls = cls.folder_cls_from_container_class(container_class=kwargs['folder_class'])
                     log.debug('Folder class %s matches container class %s (%s)', folder_cls, kwargs['folder_class'],
                               kwargs['name'])
                 except KeyError:
-                    log.debug('Fallback to container class %s (%s)', kwargs['folder_class'], kwargs['name'])
-                    folder_cls = cls
-        else:
-            folder_cls = cls
+                    pass
+            if folder_cls == Folder:
+                log.debug('Fallback to class Folder (folder_class %s, name %s)', kwargs['folder_class'], kwargs['name'])
         return folder_cls(account=account, folder_id=fld_id, changekey=changekey, **kwargs)
 
     def to_xml(self, version):
@@ -928,11 +923,11 @@ class Root(Folder):
                 if isinstance(f, ErrorInvalidOperation) and f.value == 'The distinguished folder name is unrecognized.':
                     # This is just a distinguished folder the server does not have
                     continue
-                if isinstance(f, ErrorItemNotFound) \
-                        and f.value == 'The specified object was not found in the store., The process failed ' \
-                                       'to get the correct properties.':
-                    # This another way of telling us that this is just a distinguished folder the server does not have
+                if isinstance(f, ErrorItemNotFound):
+                    # Another way of telling us that this is a distinguished folder the server does not have
                     continue
+                if isinstance(f, Exception):
+                    raise f
                 folders_map[f.folder_id] = f
             for f in FolderCollection(account=self.account, folders=[self]).find_folders(depth=DEEP):
                 if isinstance(f, Exception):
@@ -974,7 +969,7 @@ class Root(Folder):
         candidates = []
         # Try direct children of TOIS first. TOIS might not exist.
         try:
-            same_type = [f for f in self.tois.children if type(f) == folder_cls]
+            same_type = [f for f in self.tois.children if f.__class__ == folder_cls]
             are_distinguished = [f for f in same_type if f.is_distinguished]
             if are_distinguished:
                 candidates = are_distinguished
@@ -992,7 +987,7 @@ class Root(Folder):
             return candidates[0]
 
         # No candidates in TOIS. Try direct children of root.
-        same_type = [f for f in self.children if type(f) == folder_cls]
+        same_type = [f for f in self.children if f.__class__ == folder_cls]
         are_distinguished = [f for f in same_type if f.is_distinguished]
         if are_distinguished:
             candidates = are_distinguished

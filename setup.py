@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 """
 Release notes:
-* Bump version in setup.py
-* Bump version and date in README.rst
-* Bump version in CHANGELOG.rst
+* Bump version in exchangelib/__init__.py
+* Bump version in CHANGELOG.md
 * Commit and push changes
 * Push to PyPI: python setup.py sdist bdist_wheel upload
 * Create release on GitHub
@@ -14,17 +13,30 @@ import os
 from setuptools import setup
 
 
-def read(fname):
-    with io.open(os.path.join(os.path.dirname(__file__), fname), encoding='utf-8') as f:
+__version__ = None
+with io.open(os.path.join(os.path.dirname(__file__), 'exchangelib/__init__.py'), encoding='utf-8') as f:
+    for l in f:
+        if not l.startswith('__version__'):
+            continue
+        cxt = {}
+        exec(l, {}, cxt)
+        __version__ = cxt['__version__']
+        break
+
+
+def read(file_name):
+    with io.open(os.path.join(os.path.dirname(__file__), file_name), encoding='utf-8') as f:
         return f.read()
+
 
 setup(
     name='exchangelib',
-    version='1.10.7',
+    version=__version__,
     author='Erik Cederstrand',
     author_email='erik@cederstrand.dk',
     description='Client for Microsoft Exchange Web Services (EWS)',
-    long_description=read('README.rst'),
+    long_description=read('README.md'),
+    long_description_content_type='text/markdown',
     license='BSD',
     keywords='Exchange EWS autodiscover',
     install_requires=['requests>=2.7', 'requests_ntlm>=0.2.0', 'dnspython>=1.14.0', 'pytz', 'lxml>3.0',
